@@ -19,6 +19,13 @@ const volcSkInput = document.getElementById('volcSkInput');
 const volcAssetKeyHint = document.getElementById('volcAssetKeyHint');
 const volcProjectInput = document.getElementById('volcProjectInput');
 const volcRegionInput = document.getElementById('volcRegionInput');
+const jimengCliPanel = document.getElementById('jimengCliPanel');
+const jimengCliStatus = document.getElementById('jimengCliStatus');
+const jimengCredit = document.getElementById('jimengCredit');
+const jimengLoginBox = document.getElementById('jimengLoginBox');
+const jimengHelpOverlay = document.getElementById('jimengHelpOverlay');
+const jimengHelpCommand = document.getElementById('jimengHelpCommand');
+const jimengHelpOutput = document.getElementById('jimengHelpOutput');
 const runninghubConfigBlock = document.getElementById('runninghubConfigBlock');
 const rhPasteInput = document.getElementById('rhPasteInput');
 const rhAppsList = document.getElementById('rhAppsList');
@@ -68,8 +75,10 @@ const MS_DEFAULT_BASE_URL = 'https://api-inference.modelscope.cn/v1';
 const RH_DEFAULT_BASE_URL = 'https://www.runninghub.cn';
 const EXAMPLE_BASE_URL = 'https://api.example.com/v1';
 const RH_DEFAULT_IMAGE_MODELS = ['/openapi/v2/text2image'];
-const JIMENG_DEFAULT_IMAGE_MODELS = ['jimeng-image-2k', 'jimeng-image-4k'];
-const JIMENG_DEFAULT_VIDEO_MODELS = ['jimeng-video-720p', 'jimeng-video-1080p', 'seedance2.0fast_vip', 'seedance2.0_vip'];
+const JIMENG_DEFAULT_IMAGE_MODELS = ['5.0', '4.6', '4.5', '4.1', '4.0', '3.1', '3.0'];
+const JIMENG_DEFAULT_VIDEO_MODELS = ['seedance2.0fast_vip', 'seedance2.0_vip'];
+const JIMENG_LEGACY_IMAGE_MODELS = new Set(['jimeng-image-2k', 'jimeng-image-4k']);
+const JIMENG_LEGACY_VIDEO_MODELS = new Set(['jimeng-video-720p', 'jimeng-video-1080p']);
 const ONBOARDING_GUIDES = {
     modelscope:{
         titleKey:'api.msOnboardingTitle',
@@ -542,8 +551,8 @@ function applyProviderOnboardingDefaults(id){
     } else if(id === 'jimeng'){
         item.base_url = '';
         item.protocol = 'jimeng';
-        item.image_models = unique([...(item.image_models || []), ...JIMENG_DEFAULT_IMAGE_MODELS]);
-        item.video_models = unique([...(item.video_models || []), ...JIMENG_DEFAULT_VIDEO_MODELS]);
+        item.image_models = unique([...(item.image_models || []).filter(model => !JIMENG_LEGACY_IMAGE_MODELS.has(String(model || '').trim())), ...JIMENG_DEFAULT_IMAGE_MODELS]);
+        item.video_models = unique([...(item.video_models || []).filter(model => !JIMENG_LEGACY_VIDEO_MODELS.has(String(model || '').trim())), ...JIMENG_DEFAULT_VIDEO_MODELS]);
     }
     selectedId = item.id;
     renderEditor();
@@ -2156,6 +2165,8 @@ function renderEditor(){
     if(isJimeng){
         item.base_url = '';
         item.protocol = 'jimeng';
+        item.image_models = unique([...(item.image_models || []).filter(model => !JIMENG_LEGACY_IMAGE_MODELS.has(String(model || '').trim())), ...JIMENG_DEFAULT_IMAGE_MODELS]);
+        item.video_models = unique([...(item.video_models || []).filter(model => !JIMENG_LEGACY_VIDEO_MODELS.has(String(model || '').trim())), ...JIMENG_DEFAULT_VIDEO_MODELS]);
         keyInput.placeholder = '即梦 CLI 使用本机 dreamina login，无需 API Key';
         keyHint.textContent = '请先在终端安装 dreamina CLI，并执行 dreamina login';
     }
@@ -2177,6 +2188,11 @@ function renderEditor(){
         if(rhWorkflowsCount) rhWorkflowsCount.textContent = '0';
     }
     if(msLoraBlock) msLoraBlock.style.display = isModelScope ? 'flex' : 'none';
+    if(jimengCliPanel){
+        jimengCliPanel.hidden = !isJimeng;
+        jimengCliPanel.style.display = isJimeng ? 'flex' : 'none';
+        if(isJimeng) refreshJimengStatus(false);
+    }
     const deleteBtn = document.getElementById('deleteBtn');
     if(deleteBtn) deleteBtn.style.display = isFixedProvider(item) ? 'none' : 'inline-flex';
     renderModels('image');
@@ -2188,6 +2204,157 @@ function renderEditor(){
 }
 function showVerifyResult(html){ const el = document.getElementById('verifyResult'); if(el){ el.style.display = 'block'; el.innerHTML = html; } }
 function clearVerifyResult(){ const el = document.getElementById('verifyResult'); if(el){ el.style.display = 'none'; el.innerHTML = ''; } }
+function prettyJson(value){
+    try { return JSON.stringify(value, null, 2); } catch(_) { return String(value || ''); }
+}
+function jimengCreditText(raw){
+    if(!raw) return '';
+    const parts = [];
+    const seen = new Set();
+    const visit = value => {
+        if(!value || typeof value !== 'object') return;
+        Object.entries(value).forEach(([key, item]) => {
+            const low = key.toLowerCase();
+            if(/credit|balance|quota|point|coin|积分|余额/.test(low) && item !== null && typeof item !== 'object'){
+                const label = `${key}: ${item}`;
+                if(!seen.has(label)){ seen.add(label); parts.push(label); }
+            }
+            if(item && typeof item === 'object') visit(item);
+        });
+    };
+    visit(raw);
+    return parts.join(' · ') || prettyJson(raw);
+}
+function setJimengStatus(text, ok=null){
+    if(!jimengCliStatus) return;
+    jimengCliStatus.textContent = text || '未检测';
+    jimengCliStatus.classList.toggle('ok', ok === true);
+    jimengCliStatus.classList.toggle('bad', ok === false);
+}
+function renderJimengLoginBox(data){
+    if(!jimengLoginBox) return;
+    const text = data?.text || '';
+    const qrUrl = data?.qr_url || '';
+    const qrHtml = qrUrl && qrUrl.startsWith('http')
+        ? `<img class="jimeng-qr-img" src="${escapeHtml(qrUrl)}" alt="即梦登录二维码">`
+        : '';
+    jimengLoginBox.hidden = false;
+    jimengLoginBox.innerHTML = `${qrHtml}<pre>${escapeHtml(text || '等待 CLI 输出登录二维码...')}</pre>`;
+}
+let jimengLoginTimer = null;
+async function refreshJimengStatus(showCredit=true){
+    if(!jimengCliPanel || jimengCliPanel.hidden) return;
+    setJimengStatus('检测中...');
+    try {
+        const data = await fetch('/api/jimeng/status').then(r => r.json());
+        setJimengStatus(data.logged_in ? '已登录' : (data.installed ? '未登录' : '未安装'), data.logged_in === true);
+        if(data.installed && data.version_ok === false && jimengCredit){
+            jimengCredit.textContent = `⚠ 检测到 dreamina CLI 版本 ${data.cli_version || '未知'}，低于推荐的 ${data.min_version || '1.4.2'}。旧版本任务状态可能无法更新，请升级 CLI。`;
+        } else if(showCredit && data.raw && jimengCredit){
+            jimengCredit.textContent = jimengCreditText(data.raw);
+        }
+    } catch(e){
+        setJimengStatus('检测失败', false);
+        if(jimengCredit) jimengCredit.textContent = e.message || String(e);
+    }
+}
+async function startJimengLogin(){
+    setJimengStatus('等待扫码...');
+    if(jimengCredit) jimengCredit.textContent = '';
+    try {
+        const data = await fetch('/api/jimeng/login/start', {method:'POST'}).then(async r => {
+            const json = await r.json();
+            if(!r.ok) throw new Error(json.detail || '启动登录失败');
+            return json;
+        });
+        renderJimengLoginBox(data);
+        clearInterval(jimengLoginTimer);
+        jimengLoginTimer = setInterval(pollJimengLogin, 2500);
+        refreshIcons();
+    } catch(e){
+        setJimengStatus('登录失败', false);
+        if(jimengLoginBox){
+            jimengLoginBox.hidden = false;
+            jimengLoginBox.innerHTML = `<pre>${escapeHtml(e.message || String(e))}</pre>`;
+        }
+    }
+}
+async function pollJimengLogin(){
+    try {
+        const data = await fetch('/api/jimeng/login/status').then(r => r.json());
+        renderJimengLoginBox(data);
+        if(data.logged_in){
+            clearInterval(jimengLoginTimer);
+            setJimengStatus('已登录', true);
+            if(jimengCredit) jimengCredit.textContent = jimengCreditText(data.raw);
+        } else if(data.running){
+            setJimengStatus('等待扫码...');
+        } else {
+            setJimengStatus('未登录', false);
+        }
+    } catch(e){
+        clearInterval(jimengLoginTimer);
+        setJimengStatus('登录检测失败', false);
+    }
+}
+async function refreshJimengCredit(){
+    setJimengStatus('查询余额...');
+    try {
+        const data = await fetch('/api/jimeng/credit').then(async r => {
+            const json = await r.json();
+            if(!r.ok) throw new Error(json.detail || '查询余额失败');
+            return json;
+        });
+        setJimengStatus('已登录', true);
+        if(jimengCredit) jimengCredit.textContent = jimengCreditText(data.raw);
+    } catch(e){
+        setJimengStatus('未登录', false);
+        if(jimengCredit) jimengCredit.textContent = e.message || String(e);
+    }
+}
+async function logoutJimeng(){
+    if(!confirm('确认退出即梦 CLI 登录？')) return;
+    try {
+        const data = await fetch('/api/jimeng/logout', {method:'POST'}).then(async r => {
+            const json = await r.json();
+            if(!r.ok) throw new Error(json.detail || '退出登录失败');
+            return json;
+        });
+        setJimengStatus('已退出', false);
+        if(jimengCredit) jimengCredit.textContent = prettyJson(data.raw);
+        if(jimengLoginBox) jimengLoginBox.hidden = true;
+    } catch(e){
+        setJimengStatus('退出失败', false);
+        if(jimengCredit) jimengCredit.textContent = e.message || String(e);
+    }
+}
+function openJimengHelp(){
+    if(!jimengHelpOverlay) return;
+    jimengHelpOverlay.style.display = 'flex';
+    loadJimengHelp();
+}
+function closeJimengHelp(){
+    if(jimengHelpOverlay) jimengHelpOverlay.style.display = 'none';
+}
+async function loadJimengHelp(){
+    if(!jimengHelpOutput) return;
+    jimengHelpOutput.textContent = '加载中...';
+    try {
+        const command = jimengHelpCommand?.value || '';
+        const data = await fetch('/api/jimeng/help', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({command})
+        }).then(async r => {
+            const json = await r.json();
+            if(!r.ok) throw new Error(json.detail || '加载帮助失败');
+            return json;
+        });
+        jimengHelpOutput.textContent = data.text || prettyJson(data.raw);
+    } catch(e){
+        jimengHelpOutput.textContent = e.message || String(e);
+    }
+}
 function currentProviderApiKey(item){
     if(item?.id === 'runninghub'){
         return rhWalletKeyInput?.value.trim() || rhFreeKeyInput?.value.trim() || '';
@@ -2665,6 +2832,7 @@ async function saveProviders(){
             ? 'jimeng'
             : ['openai', 'apimart', 'gemini', 'jimeng'].includes(String(item.protocol || '').toLowerCase()) ? String(item.protocol).toLowerCase() : 'openai';
         if(item.id === 'jimeng') item.base_url = '';
+        if(item.id === 'jimeng') item.video_models = unique([...(item.video_models || []).filter(model => !JIMENG_LEGACY_VIDEO_MODELS.has(String(model || '').trim())), ...JIMENG_DEFAULT_VIDEO_MODELS]);
         item.image_generation_endpoint = '';
         item.image_edit_endpoint = '';
         item.image_models = unique(item.image_models || []);

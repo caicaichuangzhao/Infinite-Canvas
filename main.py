@@ -1,6 +1,9 @@
 import json
 import uuid
 import base64
+import hashlib
+import hmac
+import datetime
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -220,20 +223,43 @@ LOAD_LOCK = Lock()
 RUNNINGHUB_WORKFLOW_LOCK = Lock()
 NEXT_TASK_ID = 1
 UPDATE_LOCK = Lock()
+JIMENG_LOGIN_SESSION = {
+    "proc": None,
+    "stdout": "",
+    "stderr": "",
+    "started_at": 0.0,
+}
 
 PROVIDER_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{2,40}$")
 SUPPORTED_PROVIDER_PROTOCOLS = {"openai", "apimart", "gemini", "volcengine", "runninghub", "jimeng"}
 RUNNINGHUB_DEFAULT_BASE_URL = "https://www.runninghub.cn"
 JIMENG_DEFAULT_IMAGE_MODELS = [
-    "jimeng-image-2k",
-    "jimeng-image-4k",
+    "5.0",
+    "4.6",
+    "4.5",
+    "4.1",
+    "4.0",
+    "3.1",
+    "3.0",
 ]
 JIMENG_DEFAULT_VIDEO_MODELS = [
+    "seedance2.0_vip",
+    "seedance2.0fast_vip",
+    "seedance2.0",
+    "seedance2.0fast",
+    "3.5pro",
+    "3.0pro",
+    "3.0",
+    "3.0fast",
+]
+JIMENG_LEGACY_IMAGE_MODELS = {
+    "jimeng-image-2k",
+    "jimeng-image-4k",
+}
+JIMENG_LEGACY_VIDEO_MODELS = {
     "jimeng-video-720p",
     "jimeng-video-1080p",
-    "seedance2.0fast_vip",
-    "seedance2.0_vip",
-]
+}
 try:
     JIMENG_DEFAULT_POLL_SECONDS = max(1, min(3600, int(os.getenv("JIMENG_POLL_SECONDS", "900"))))
 except Exception:
@@ -754,8 +780,14 @@ def merge_default_api_providers(providers):
         else:
             current["protocol"] = "jimeng"
             current["base_url"] = ""
-            current["image_models"] = model_list_from_values([*(current.get("image_models") or []), *JIMENG_DEFAULT_IMAGE_MODELS])
-            current["video_models"] = model_list_from_values([*(current.get("video_models") or []), *JIMENG_DEFAULT_VIDEO_MODELS])
+            current["image_models"] = model_list_from_values([
+                *[item for item in (current.get("image_models") or []) if str(item or "").strip() not in JIMENG_LEGACY_IMAGE_MODELS],
+                *JIMENG_DEFAULT_IMAGE_MODELS,
+            ])
+            current["video_models"] = model_list_from_values([
+                *[item for item in (current.get("video_models") or []) if str(item or "").strip() not in JIMENG_LEGACY_VIDEO_MODELS],
+                *JIMENG_DEFAULT_VIDEO_MODELS,
+            ])
     return merged
 
 def normalize_model_list(values):
@@ -1860,6 +1892,7 @@ class CanvasVideoRequest(BaseModel):
     size: str = ""
     images: List[AIReference] = []
     videos: List[str] = []
+    audios: List[str] = []
     enhance_prompt: bool = False
     enable_upsample: bool = False
     watermark: bool = False
@@ -1868,6 +1901,7 @@ class CanvasVideoRequest(BaseModel):
     return_last_frame: bool = False
     generate_audio: bool = False
     multimodal: bool = False
+    trusted_asset: bool = False
 
 class TempShUploadRequest(BaseModel):
     url: str = ""
@@ -1891,6 +1925,13 @@ class RunningHubWorkflowSubmitRequest(BaseModel):
 class RunningHubUploadAssetRequest(BaseModel):
     url: str = ""
     useWallet: bool = False
+
+class JimengHelpRequest(BaseModel):
+    command: str = ""
+
+class JimengQueryMediaRequest(BaseModel):
+    submit_id: str = ""
+    kind: str = "image"
 
 class RunningHubWorkflowConfigField(BaseModel):
     id: str = ""
@@ -2060,6 +2101,12 @@ class AssetLibraryBatchCropRequest(BaseModel):
     target_library_id: str = ""
     target_category_id: str = ""
     mode: str = "square"
+
+class AssetAvatarRegisterRequest(BaseModel):
+    library_id: str = ""
+    provider_id: str = ""
+    project_name: str = "default"
+    group_name: str = ""
 
 class PromptLibraryRequest(BaseModel):
     name: str = "提示词库"
@@ -2696,6 +2743,24 @@ def is_runninghub_provider(provider):
 def is_jimeng_provider(provider):
     return provider_protocol(provider) == "jimeng" or str((provider or {}).get("id") or "").strip().lower() == "jimeng"
 
+# ---- 数字人/真人认证：平台无关分发 ----
+# 认证是一个跨平台功能。每个平台用不同的资产 API 实现，但对外是统一入口。
+# 新增平台时：在 avatar_platform_for_provider 里加一条识别，并把平台键加进
+# AVATAR_SUPPORTED_PLATFORMS，再在 register/avatar-status 端点里补一个分发分支即可。
+AVATAR_SUPPORTED_PLATFORMS = {"apimart", "volcengine"}  # 已接入官方资产 API 的平台
+
+def avatar_platform_for_provider(provider) -> str:
+    if not provider:
+        return ""
+    if is_apimart_provider(provider):
+        return "apimart"
+    if is_volcengine_provider(provider):
+        return "volcengine"
+    return ""
+
+def provider_supports_avatar(provider) -> bool:
+    return avatar_platform_for_provider(provider) in AVATAR_SUPPORTED_PLATFORMS
+
 def jimeng_env_value(key):
     return os.getenv(key, "") or read_api_env_value(key)
 
@@ -2728,8 +2793,7 @@ def decode_wsl_output(data: bytes) -> str:
 
 def jimeng_wsl_base_args(exe="wsl.exe"):
     configured = str(jimeng_env_value("JIMENG_WSL_DISTRO") or "").strip()
-    if configured:
-        return ["-d", configured]
+    names = []
     try:
         proc = subprocess.run(
             [exe, "-l", "-q"],
@@ -2740,15 +2804,23 @@ def jimeng_wsl_base_args(exe="wsl.exe"):
             check=False,
         )
         names = [
-            line.replace("\x00", "").strip()
+            line.replace("\x00", "").strip().lstrip("*").strip()
             for line in decode_wsl_output(proc.stdout).splitlines()
+            if line.replace("\x00", "").strip()
         ]
+    except Exception:
+        names = []
+    if configured and (not names or configured in names):
+        return ["-d", configured]
+    if configured and names:
+        print(f"JIMENG_WSL_DISTRO={configured} 不存在，已回退自动选择。可用发行版：{names}")
+    try:
         ubuntu = next((name for name in names if re.match(r"^Ubuntu($|-)", name)), "")
         if ubuntu:
             return ["-d", ubuntu]
     except Exception:
         pass
-    return ["-d", "Ubuntu"]
+    return []
 
 def jimeng_clean_wsl_stderr(text):
     lines = []
@@ -2812,21 +2884,12 @@ def jimeng_extract_json(text):
         return weight
     return max(parsed, key=score)[1] if parsed else {"text": text}
 
-async def run_jimeng_cli(args, timeout=120):
+async def run_jimeng_cli(args, timeout=120, raw_text=False):
     exe = jimeng_cli_executable()
     if not exe:
         raise HTTPException(status_code=400, detail="未找到 dreamina CLI。请先安装：curl -fsSL https://jimeng.jianying.com/cli | bash，并完成 dreamina login。")
     clean_args = [str(arg) for arg in args if str(arg) != ""]
-    if jimeng_use_wsl():
-        shell_line = (
-            ". ~/.profile >/dev/null 2>&1 || true; . ~/.bashrc >/dev/null 2>&1 || true; "
-            "DREAMINA_BIN=$(command -v dreamina || find \"$HOME\" -maxdepth 4 -type f -name dreamina 2>/dev/null | head -n 1); "
-            "if [ -z \"$DREAMINA_BIN\" ]; then echo 'dreamina CLI not found in WSL' >&2; exit 127; fi; "
-            "\"$DREAMINA_BIN\" " + " ".join(shlex.quote(arg) for arg in clean_args)
-        )
-        command = [exe, *jimeng_wsl_base_args(exe), "-e", "sh", "-lc", shell_line]
-    else:
-        command = [exe, *clean_args]
+    command = jimeng_command(clean_args, exe)
     try:
         proc = await asyncio.create_subprocess_exec(
             *command,
@@ -2839,18 +2902,95 @@ async def run_jimeng_cli(args, timeout=120):
         raise HTTPException(status_code=504, detail=f"即梦 CLI 执行超时：{' '.join(command[:3])}") from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=400, detail=f"未找到即梦 CLI：{exe}") from exc
-    out_text = (decode_wsl_output(stdout) if jimeng_use_wsl() else stdout.decode("utf-8", errors="replace")).strip()
-    err_text = (decode_wsl_output(stderr) if jimeng_use_wsl() else stderr.decode("utf-8", errors="replace")).strip()
-    clean_err_text = jimeng_clean_wsl_stderr(err_text) if jimeng_use_wsl() else err_text
-    raw = jimeng_extract_json(f"{out_text}\n{clean_err_text}".strip())
+    out_text, clean_err_text = jimeng_decode_cli_output(stdout, stderr)
     if proc.returncode != 0:
         message = clean_err_text or out_text or f"exit={proc.returncode}"
         raise HTTPException(status_code=502, detail=f"即梦 CLI 调用失败：{message[:1000]}")
+    # 帮助等纯文本输出不应被 JSON 提取吞掉（如 [0.5, 8] 会被误判为结果）
+    if raw_text:
+        return {"_stdout": out_text, "_stderr": clean_err_text}
+    raw = jimeng_extract_json(f"{out_text}\n{clean_err_text}".strip())
     if isinstance(raw, dict):
         raw.setdefault("_stdout", out_text)
         if clean_err_text:
             raw.setdefault("_stderr", clean_err_text)
     return raw
+
+# 旧版 dreamina CLI 将 submit_id 用 16 位 hex，v1.4.2 起升级为 UUID，
+# 与当前轮询逻辑不兼容。这里做尽力而为的版本探测，失败不阻断主流程。
+JIMENG_MIN_CLI_VERSION = (1, 4, 2)
+
+def jimeng_parse_version(text):
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", str(text or ""))
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+async def jimeng_cli_version():
+    for flag in ("--version", "-V", "version"):
+        try:
+            raw = await run_jimeng_cli([flag], timeout=15)
+        except HTTPException:
+            continue
+        text = raw if isinstance(raw, str) else (raw.get("_stdout") or raw.get("_stderr") or "" if isinstance(raw, dict) else "")
+        version = jimeng_parse_version(text)
+        if version:
+            return version, str(text).strip()
+    return None, ""
+
+def jimeng_command(clean_args, exe=None):
+    exe = exe or jimeng_cli_executable()
+    if jimeng_use_wsl():
+        shell_line = (
+            ". ~/.profile >/dev/null 2>&1 || true; . ~/.bashrc >/dev/null 2>&1 || true; "
+            "DREAMINA_BIN=$(command -v dreamina || find \"$HOME\" -maxdepth 4 -type f -name dreamina 2>/dev/null | head -n 1); "
+            "if [ -z \"$DREAMINA_BIN\" ]; then echo 'dreamina CLI not found in WSL' >&2; exit 127; fi; "
+            "\"$DREAMINA_BIN\" " + " ".join(shlex.quote(arg) for arg in clean_args)
+        )
+        return [exe, *jimeng_wsl_base_args(exe), "-e", "sh", "-lc", shell_line]
+    return [exe, *clean_args]
+
+def jimeng_decode_cli_output(stdout, stderr):
+    out_text = (decode_wsl_output(stdout) if jimeng_use_wsl() else stdout.decode("utf-8", errors="replace")).strip()
+    err_text = (decode_wsl_output(stderr) if jimeng_use_wsl() else stderr.decode("utf-8", errors="replace")).strip()
+    clean_err_text = jimeng_clean_wsl_stderr(err_text) if jimeng_use_wsl() else err_text
+    return out_text, clean_err_text
+
+def jimeng_login_text():
+    parts = []
+    for key in ("stdout", "stderr"):
+        value = str(JIMENG_LOGIN_SESSION.get(key) or "").strip()
+        if value:
+            parts.append(value)
+    return "\n".join(parts).strip()
+
+def jimeng_login_qr_from_text(text):
+    text = str(text or "")
+    candidates = []
+    patterns = [
+        r"(https?://[^\s\"'<>]+)",
+        r"(dreamina://[^\s\"'<>]+)",
+        r"(data:image/[^\s\"'<>]+)",
+    ]
+    for pattern in patterns:
+        candidates.extend(re.findall(pattern, text))
+    for value in candidates:
+        if "login" in value.lower() or "qr" in value.lower() or value.startswith(("data:image", "dreamina://")):
+            return value
+    return candidates[0] if candidates else ""
+
+async def jimeng_login_reader(proc):
+    async def read_stream(stream, key):
+        while True:
+            chunk = await stream.readline()
+            if not chunk:
+                break
+            text = (decode_wsl_output(chunk) if jimeng_use_wsl() else chunk.decode("utf-8", errors="replace"))
+            if key == "stderr":
+                text = jimeng_clean_wsl_stderr(text)
+            if text:
+                JIMENG_LOGIN_SESSION[key] = str(JIMENG_LOGIN_SESSION.get(key) or "") + text
+    await asyncio.gather(read_stream(proc.stdout, "stdout"), read_stream(proc.stderr, "stderr"))
 
 def jimeng_submit_id(raw):
     found = []
@@ -2866,6 +3006,53 @@ def jimeng_submit_id(raw):
                 visit(item)
     visit(raw)
     return found[0] if found else ""
+
+class JimengPendingError(Exception):
+    """即梦任务还在云端排队/生成（轮询超时但未失败）。submit_id 可用于后续续查。"""
+    def __init__(self, submit_id, kind="image", queue_info=None, raw=None):
+        self.submit_id = str(submit_id or "")
+        self.kind = kind or "image"
+        self.queue_info = queue_info if isinstance(queue_info, dict) else {}
+        self.raw = raw
+        super().__init__(f"jimeng pending submit_id={self.submit_id}")
+
+def jimeng_queue_info(raw):
+    """从即梦原始返回里就近取出 queue_info（含 queue_idx/queue_length/queue_status）。"""
+    found = []
+    def visit(value):
+        if isinstance(value, dict):
+            qi = value.get("queue_info")
+            if isinstance(qi, dict) and qi:
+                found.append(qi)
+            for item in value.values():
+                if isinstance(item, (dict, list)):
+                    visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+    visit(raw)
+    return found[0] if found else {}
+
+def jimeng_pending_payload(exc: "JimengPendingError"):
+    qi = exc.queue_info or {}
+    idx = qi.get("queue_idx")
+    length = qi.get("queue_length")
+    if idx is not None and length is not None:
+        msg = f"即梦云端排队中（第 {idx}/{length} 位），任务未丢失，可继续等待或手动查询。submit_id={exc.submit_id}"
+    else:
+        msg = f"即梦任务仍在生成中，任务未丢失。submit_id={exc.submit_id}"
+    return {
+        "jimeng_pending": True,
+        "submit_id": exc.submit_id,
+        "kind": exc.kind,
+        "queue_info": qi,
+        "message": msg,
+    }
+
+@app.exception_handler(JimengPendingError)
+async def jimeng_pending_exception_handler(request: Request, exc: JimengPendingError):
+    # 轮询超时但任务还在云端排队：返回 202 + submit_id，让前端保持「排队中」卡片并续查
+    return JSONResponse(status_code=202, content=jimeng_pending_payload(exc))
 
 def jimeng_failure_reason(raw):
     found = []
@@ -2928,35 +3115,73 @@ def jimeng_ratio_from_size(size, fallback="1:1"):
     left, right = min(JIMENG_RATIO_CHOICES, key=lambda item: abs(ratio - item[0] / item[1]))
     return f"{left}:{right}"
 
-def jimeng_image_resolution(model, size):
+# 官方 dreamina 支持的图片模型（来自 text2image/image2image -h）。
+# image2image 不支持 3.0/3.1。
+JIMENG_TEXT2IMAGE_MODELS = {"3.0", "3.1", "4.0", "4.1", "4.5", "4.6", "5.0"}
+JIMENG_IMAGE2IMAGE_MODELS = {"4.0", "4.1", "4.5", "4.6", "5.0"}
+
+def jimeng_normalize_image_model(model):
+    match = re.search(r"(\d+\.\d+)", str(model or ""))
+    return match.group(1) if match else ""
+
+def jimeng_image_model_version(model, mode="text2image"):
+    version = jimeng_normalize_image_model(model)
+    allowed = JIMENG_IMAGE2IMAGE_MODELS if mode == "image2image" else JIMENG_TEXT2IMAGE_MODELS
+    return version if version in allowed else ""
+
+def jimeng_image_resolution(model, size, mode="text2image"):
     text = str(model or "").lower()
     if "4k" in text:
-        return "4k"
-    if "1k" in text:
-        return "1k"
-    if "2k" in text:
-        return "2k"
-    width, height = parse_size_pair(size)
-    return "4k" if max(width, height) > 2048 else "2k"
+        desired = "4k"
+    elif "1k" in text:
+        desired = "1k"
+    elif "2k" in text:
+        desired = "2k"
+    else:
+        width, height = parse_size_pair(size)
+        desired = "4k" if max(width, height) > 2048 else "2k"
+    # 按官方规则收敛到模型允许的分辨率
+    version = jimeng_normalize_image_model(model)
+    if mode == "image2image":
+        # image2image 只支持 2k/4k
+        return "4k" if desired == "4k" else "2k"
+    if version in ("3.0", "3.1"):
+        # 3.0/3.1 只支持 1k/2k
+        return "1k" if desired == "1k" else "2k"
+    # 4.x/5.0 只支持 2k/4k
+    return "4k" if desired == "4k" else "2k"
+
+# 仅 VIP seedance 支持 1080P；其余模型最高 720P（官方无 480P 选项）
+JIMENG_VIDEO_1080P_MODELS = {"seedance2.0_vip", "seedance2.0fast_vip"}
 
 def jimeng_video_resolution(model, resolution):
-    value = str(resolution or "").strip().upper()
-    if value in {"480P", "720P", "1080P"}:
-        return value
-    text = str(model or "").lower()
-    if "1080" in text:
+    version = jimeng_video_model_version(model)
+    requested = str(resolution or "").strip().upper()
+    if requested not in {"480P", "720P", "1080P"}:
+        text = str(model or "").lower()
+        requested = "1080P" if "1080" in text else "720P"
+    if requested == "1080P" and version in JIMENG_VIDEO_1080P_MODELS:
         return "1080P"
-    if "480" in text:
-        return "480P"
     return "720P"
 
-def jimeng_video_duration(duration):
+# 各模型支持的时长区间（秒）：3.0 系列 3-10，3.5pro 4-12，seedance 4-15
+def jimeng_video_duration_range(model):
+    version = jimeng_video_model_version(model)
+    if version in ("3.0", "3.0fast", "3.0pro"):
+        return 3, 10
+    if version == "3.5pro":
+        return 4, 12
+    return 4, 15
+
+def jimeng_video_duration(duration, model=None):
+    low, high = jimeng_video_duration_range(model)
+    default = max(low, min(high, 5))
     try:
         text = str(duration).strip() if duration is not None else ""
-        value = 5 if text == "" else int(text)
+        value = default if text == "" else int(text)
     except Exception:
-        value = 5
-    return max(4, min(15, value))
+        value = default
+    return max(low, min(high, value))
 
 def jimeng_transition_duration(total_duration, transition_count):
     count = max(1, int(transition_count or 1))
@@ -3089,7 +3314,7 @@ async def jimeng_store_outputs(raw, kind="image", allow_query=True):
             raise
     status_text = json.dumps(raw, ensure_ascii=False)[:800] if isinstance(raw, (dict, list)) else str(raw)[:800]
     if submit_id:
-        raise HTTPException(status_code=504, detail=f"即梦任务仍在生成中，submit_id={submit_id}。稍后可用 dreamina query_result --submit_id={submit_id} 查询。原始返回：{status_text}")
+        raise JimengPendingError(submit_id, kind, jimeng_queue_info(raw), raw)
     raise HTTPException(status_code=502, detail=f"即梦 CLI 未返回可用媒体结果：{status_text}")
 
 async def jimeng_prepare_local_media(ref_url, kind="image"):
@@ -3109,7 +3334,7 @@ async def jimeng_prepare_local_media(ref_url, kind="image"):
             return path, []
     if os.path.isfile(text):
         return text, []
-    suffix = ".mp4" if kind == "video" else ".png"
+    suffix = ".mp4" if kind == "video" else (".mp3" if kind == "audio" else ".png")
     temp_paths = []
     if text.startswith("data:"):
         if ";base64," not in text:
@@ -3143,21 +3368,27 @@ async def generate_jimeng_provider_image(prompt, size, model, reference_images=N
         if refs:
             image_path, created = await jimeng_prepare_local_media(refs[0].get("url"), "image")
             temp_paths.extend(created)
+            model_version = jimeng_image_model_version(model, "image2image")
             args = [
                 "image2image",
                 f"--images={jimeng_cli_path_arg(image_path)}",
                 f"--prompt={prompt}",
-                f"--resolution_type={jimeng_image_resolution(model, size)}",
+                f"--resolution_type={jimeng_image_resolution(model, size, 'image2image')}",
                 f"--poll={jimeng_poll_seconds()}",
             ]
+            if model_version:
+                args.append(f"--model_version={model_version}")
         else:
+            model_version = jimeng_image_model_version(model, "text2image")
             args = [
                 "text2image",
                 f"--prompt={prompt}",
                 f"--ratio={jimeng_ratio_from_size(size)}",
-                f"--resolution_type={jimeng_image_resolution(model, size)}",
+                f"--resolution_type={jimeng_image_resolution(model, size, 'text2image')}",
                 f"--poll={jimeng_poll_seconds()}",
             ]
+            if model_version:
+                args.append(f"--model_version={model_version}")
         raw = await run_jimeng_cli(args, timeout=jimeng_poll_seconds() + 120)
         urls = await jimeng_store_outputs(raw, "image")
         return {"type": "url", "value": urls[0]}, raw
@@ -3171,20 +3402,26 @@ async def generate_jimeng_provider_image(prompt, size, model, reference_images=N
 async def generate_jimeng_video(payload: CanvasVideoRequest, provider):
     image_refs = [ref for ref in (payload.images or []) if jimeng_video_ref_url(ref)]
     video_refs = [url for url in (payload.videos or []) if str(url or "").strip()]
-    duration = jimeng_video_duration(payload.duration)
+    audio_refs = [url for url in (payload.audios or []) if str(url or "").strip()][:3]
+    duration = jimeng_video_duration(payload.duration, payload.model)
     temp_paths = []
     try:
-        if payload.multimodal or video_refs:
+        if payload.multimodal or video_refs or audio_refs:
             image_paths = []
             video_paths = []
-            for ref in image_refs:
+            audio_paths = []
+            for ref in image_refs[:9]:
                 image_path, created = await jimeng_prepare_local_media(jimeng_video_ref_url(ref), "image")
                 temp_paths.extend(created)
                 image_paths.append(image_path)
-            for ref_url in video_refs:
+            for ref_url in video_refs[:3]:
                 video_path, created = await jimeng_prepare_local_media(ref_url, "video")
                 temp_paths.extend(created)
                 video_paths.append(video_path)
+            for ref_url in audio_refs:
+                audio_path, created = await jimeng_prepare_local_media(ref_url, "audio")
+                temp_paths.extend(created)
+                audio_paths.append(audio_path)
             args = [
                 "multimodal2video",
                 f"--prompt={payload.prompt}",
@@ -3199,6 +3436,8 @@ async def generate_jimeng_video(payload: CanvasVideoRequest, provider):
                 args.append(f"--image={jimeng_cli_path_arg(image_path)}")
             for video_path in video_paths:
                 args.append(f"--video={jimeng_cli_path_arg(video_path)}")
+            for audio_path in audio_paths:
+                args.append(f"--audio={jimeng_cli_path_arg(audio_path)}")
         elif len(image_refs) >= 2:
             first_frame = next((ref for ref in image_refs if jimeng_video_ref_role(ref) == "first_frame"), None)
             last_frame = next((ref for ref in image_refs if jimeng_video_ref_role(ref) == "last_frame"), None)
@@ -3479,6 +3718,9 @@ def normalize_asset_library(lib):
         cats = library.get("categories") if isinstance(library.get("categories"), list) else []
         if not any(c.get("type") == "workflow" for c in cats):
             cats.append({"id": "workflows", "name": "工作流", "type": "workflow", "items": []})
+        for cat in cats:
+            for item in (cat.get("items") or []):
+                migrate_asset_item_registrations(item)
         library["categories"] = cats
     active = str(lib.get("active_library_id") or libraries[0].get("id") or "default")
     if not any(item.get("id") == active for item in libraries):
@@ -3490,6 +3732,32 @@ def normalize_asset_library(lib):
     lib["updated_at"] = int(lib.get("updated_at") or now_ms())
     sort_asset_library_items(lib)
     return lib
+
+AVATAR_LEGACY_FLAT_FIELDS = ("platform", "provider_id", "project_name", "avatar_task_id",
+                             "avatar_status", "avatar_detail", "asset_uri", "asset_id", "registered_at")
+
+def migrate_asset_item_registrations(item):
+    """一个素材可注册到多平台：把旧的单平台扁平字段折叠进 item['registrations'][platform]，再清掉旧字段。"""
+    if not isinstance(item, dict):
+        return
+    regs = item.get("registrations")
+    if not isinstance(regs, dict):
+        regs = {}
+    legacy_platform = str(item.get("platform") or "").strip()
+    if legacy_platform and legacy_platform not in regs and (item.get("asset_uri") or item.get("avatar_task_id")):
+        regs[legacy_platform] = {
+            "provider_id": item.get("provider_id") or "",
+            "project_name": item.get("project_name") or "default",
+            "task_id": item.get("avatar_task_id") or "",
+            "status": item.get("avatar_status") or "",
+            "detail": item.get("avatar_detail") or "",
+            "asset_uri": item.get("asset_uri") or "",
+            "asset_id": item.get("asset_id") or "",
+            "registered_at": item.get("registered_at") or 0,
+        }
+    item["registrations"] = regs if isinstance(regs, dict) else {}
+    for key in AVATAR_LEGACY_FLAT_FIELDS:
+        item.pop(key, None)
 
 def load_asset_library():
     if not os.path.exists(ASSET_LIBRARY_PATH):
@@ -4083,6 +4351,22 @@ def valid_apimart_video_image_input(value: str) -> bool:
     value = value.strip()
     return value.startswith("http://") or value.startswith("https://") or value.startswith("asset://")
 
+def apply_trusted_asset_prompt_index(prompt: str, image_count: int, video_count: int, audio_count: int) -> str:
+    """可信素材模式下，按平台规则在 prompt 里补「图片N/视频N/音频N」索引。
+    若用户已手动引用了某类素材（如已写「图片1」），则不重复追加该类。"""
+    text = str(prompt or "").strip()
+    segments = []
+    for label, count in (("图片", image_count), ("视频", video_count), ("音频", audio_count)):
+        if count <= 0:
+            continue
+        if any(f"{label}{i}" in text for i in range(1, count + 1)):
+            continue
+        segments.append("、".join(f"{label}{i}" for i in range(1, count + 1)))
+    if not segments:
+        return text
+    hint = "参考素材：" + "，".join(segments) + "。"
+    return f"{text}\n{hint}" if text else hint
+
 def public_base_url() -> str:
     value = (
         os.getenv("PUBLIC_MEDIA_BASE_URL") or
@@ -4365,6 +4649,286 @@ async def upload_video_for_apimart(client, provider, ref_url: str) -> str:
             last_error = f"{upload_path} 异常：{e}"
             print(f"APIMart 视频上传异常: {last_error}")
     return f"ERR:APIMart 未提供可用的视频文件上传入口（{last_error}）。请配置 PUBLIC_BASE_URL，或使用公网 http/https / asset:// 视频地址。"
+
+async def upload_audio_for_apimart(client, provider, ref_url: str) -> str:
+    """把本地参考音频转换为 APIMart 可接受的 http/https 或 asset:// URL。
+    优先用公网地址（PUBLIC_BASE_URL），否则尝试上传到 APIMart 文件端点。
+    返回值以 "ERR:" 开头表示失败原因。"""
+    ref_url = str(ref_url or "").strip()
+    if not ref_url:
+        return "ERR:空地址"
+    if valid_apimart_video_image_input(ref_url):
+        return ref_url
+    public_url = local_asset_public_url(ref_url)
+    if public_url:
+        return public_url
+    base_url = video_api_root(provider)
+    upload_paths = ("/v1/uploads/audios", "/v1/uploads/files", "/v1/uploads/images")
+    last_error = ""
+    if ref_url.startswith("data:"):
+        if ";base64," not in ref_url:
+            return "ERR:不支持的 data URL（缺少 base64 段）"
+        header, encoded = ref_url.split(";base64,", 1)
+        mime = header.split(":", 1)[1].split(";", 1)[0] if ":" in header else "audio/mpeg"
+        try:
+            raw = base64.b64decode(encoded)
+        except Exception as exc:
+            return f"ERR:音频 data URL 解码失败：{exc}"
+        ext = mimetypes.guess_extension(mime) or ".mp3"
+        filename, content, content_type = (f"canvas_audio{ext}", raw, mime or "audio/mpeg")
+    elif ref_url.startswith("/output/") or ref_url.startswith("/assets/"):
+        path = output_file_from_url(ref_url)
+        if not path:
+            return "ERR:本地音频不存在或已被删除"
+        ct = content_type_for_path(path)
+        if not ct.startswith("audio/"):
+            return "ERR:参考音频不是可识别的音频文件"
+        filename, content, content_type = apimart_upload_raw_file_payload(path)
+    else:
+        return f"ERR:{apimart_video_reference_error(ref_url)}"
+    for upload_path in upload_paths:
+        upload_url = f"{base_url}{upload_path}"
+        try:
+            files = {"file": (filename, content, content_type)}
+            resp = await client.post(upload_url, headers=api_headers(json_body=False, provider=provider), files=files, timeout=180)
+            if resp.status_code in (200, 201):
+                rj = resp.json()
+                url = extract_apimart_asset_url(rj)
+                if valid_apimart_video_image_input(url):
+                    return url
+                last_error = "上传响应未包含可用 URL"
+                continue
+            last_error = f"{upload_path} 返回 {resp.status_code}: {resp.text[:200]}"
+        except Exception as exc:
+            last_error = f"{upload_path} 异常：{exc}"
+    return f"ERR:APIMart 未提供可用的音频文件上传入口（{last_error}）。请配置 PUBLIC_BASE_URL，或使用公网 http/https / asset:// 音频地址。"
+
+async def upload_media_for_apimart(client, provider, ref_url: str, kind: str) -> str:
+    """按 kind 分派到对应的 APIMart 上传器，拿回上游可用的 http/https/asset:// URL。"""
+    if kind == "video":
+        return await upload_video_for_apimart(client, provider, ref_url)
+    if kind == "audio":
+        return await upload_audio_for_apimart(client, provider, ref_url)
+    return await upload_image_for_apimart(client, provider, ref_url)
+
+def apimart_avatar_asset_type(kind: str) -> str:
+    return {"video": "Video", "audio": "Audio"}.get(str(kind or "").lower(), "Image")
+
+def extract_apimart_avatar_asset_uri(payload) -> str:
+    """从 /v1/tasks 审核结果里取出 asset://<id> 形式的可信素材 URI。"""
+    if isinstance(payload, list):
+        for item in payload:
+            found = extract_apimart_avatar_asset_uri(item)
+            if found:
+                return found
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("asset_url", "assetUrl", "uri", "url"):
+        value = str(payload.get(key) or "").strip()
+        if value.startswith("asset://"):
+            return value
+    for key in ("usable_assets", "assets", "result", "data"):
+        found = extract_apimart_avatar_asset_uri(payload.get(key))
+        if found:
+            return found
+    asset_id = str(payload.get("asset_id") or payload.get("assetId") or "").strip()
+    if asset_id:
+        return f"asset://{asset_id}"
+    return ""
+
+async def submit_apimart_avatar_asset(provider, public_url: str, name: str, kind: str, project_name: str = "default", group_name: str = "") -> str:
+    """把一个公网可访问的素材提交到 APIMart private-avatar 审核，立即返回任务 ID（不阻塞轮询）。"""
+    base_url = video_api_root(provider)
+    if not base_url:
+        raise HTTPException(status_code=400, detail=f"{provider.get('name') or provider['id']} 未配置 Base URL")
+    register_url = f"{base_url}/v1/seedance2/private-avatar"
+    body = {
+        "project_name": str(project_name or "default").strip() or "default",
+        "asset_type": apimart_avatar_asset_type(kind),
+        "group": {"name": (group_name or name or "数字人素材")[:60]},
+        "assets": [{"url": public_url, "name": (name or "asset")[:60]}],
+    }
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post(register_url, headers=api_headers(provider=provider), json=body, timeout=120)
+        if resp.status_code not in (200, 201):
+            raise HTTPException(status_code=502, detail=f"APIMart 数字人注册失败（{resp.status_code}）：{resp.text[:300]}")
+        data = resp.json()
+        task = data.get("data") if isinstance(data.get("data"), dict) else data
+        task_id = str(task.get("id") or task.get("task_id") or "").strip()
+        if not task_id:
+            raise HTTPException(status_code=502, detail=f"APIMart 数字人注册返回中未找到任务 ID：{str(data)[:300]}")
+        return task_id
+
+AVATAR_TASK_DONE_STATUSES = {"completed", "complete", "succeeded", "success", "active", "done"}
+AVATAR_TASK_FAIL_STATUSES = {"failed", "fail", "error", "rejected", "canceled", "cancelled", "expired"}
+
+async def check_apimart_avatar_task(provider, task_id: str) -> Dict[str, Any]:
+    """查询一次 APIMart 审核任务。返回 {status: Active/Processing/Failed, asset_uri, detail}。"""
+    base_url = video_api_root(provider)
+    if not base_url:
+        raise HTTPException(status_code=400, detail=f"{provider.get('name') or provider['id']} 未配置 Base URL")
+    task_url = f"{base_url}/v1/tasks/{task_id}"
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.get(task_url, headers=api_headers(provider=provider), timeout=60)
+        if resp.status_code not in (200, 201):
+            raise HTTPException(status_code=502, detail=f"查询审核状态失败（{resp.status_code}）：{resp.text[:200]}")
+        payload = resp.json()
+    node = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    status = str(node.get("status") or "").strip().lower()
+    if status in AVATAR_TASK_DONE_STATUSES:
+        asset_uri = extract_apimart_avatar_asset_uri(payload)
+        if not asset_uri:
+            return {"status": "Failed", "asset_uri": "", "detail": "审核完成，但未返回可用的 asset:// 地址（可能部分素材被拒）。"}
+        return {"status": "Active", "asset_uri": asset_uri, "detail": ""}
+    if status in AVATAR_TASK_FAIL_STATUSES:
+        return {"status": "Failed", "asset_uri": "", "detail": f"审核未通过（{status}）。"}
+    return {"status": "Processing", "asset_uri": "", "detail": "审核中"}
+
+# ---- 火山 Ark 私域素材资产（Assets）API：AK/SK 签名 V4 + CreateAssetGroup/CreateAsset/GetAsset ----
+VOLCENGINE_ARK_ASSET_HOST = "open.volcengineapi.com"
+VOLCENGINE_ARK_ASSET_SERVICE = "ark"
+VOLCENGINE_ARK_ASSET_REGION = "cn-beijing"
+VOLCENGINE_ARK_ASSET_VERSION = "2024-01-01"
+
+def _volc_hmac(key: bytes, msg: str) -> bytes:
+    return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+def volcengine_sign_v4_headers(ak: str, sk: str, action: str, body_str: str,
+                               service: str = VOLCENGINE_ARK_ASSET_SERVICE,
+                               region: str = VOLCENGINE_ARK_ASSET_REGION,
+                               version: str = VOLCENGINE_ARK_ASSET_VERSION,
+                               host: str = VOLCENGINE_ARK_ASSET_HOST) -> Dict[str, str]:
+    """火山引擎 OpenAPI 签名 V4（POST + JSON body）。返回需随请求发送的鉴权头。"""
+    method = "POST"
+    content_type = "application/json"
+    now = datetime.datetime.now(datetime.timezone.utc)
+    x_date = now.strftime("%Y%m%dT%H%M%SZ")
+    short_date = x_date[:8]
+    payload_hash = hashlib.sha256(body_str.encode("utf-8")).hexdigest()
+    # 查询串按键排序：Action < Version
+    canonical_query = f"Action={urllib.parse.quote(action, safe='')}&Version={urllib.parse.quote(version, safe='')}"
+    canonical_headers = (
+        f"content-type:{content_type}\n"
+        f"host:{host}\n"
+        f"x-content-sha256:{payload_hash}\n"
+        f"x-date:{x_date}\n"
+    )
+    signed_headers = "content-type;host;x-content-sha256;x-date"
+    canonical_request = "\n".join([method, "/", canonical_query, canonical_headers, signed_headers, payload_hash])
+    algorithm = "HMAC-SHA256"
+    credential_scope = f"{short_date}/{region}/{service}/request"
+    string_to_sign = "\n".join([
+        algorithm, x_date, credential_scope,
+        hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+    ])
+    k_date = _volc_hmac(sk.encode("utf-8"), short_date)
+    k_region = _volc_hmac(k_date, region)
+    k_service = _volc_hmac(k_region, service)
+    k_signing = _volc_hmac(k_service, "request")
+    signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    authorization = (
+        f"{algorithm} Credential={ak}/{credential_scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
+    )
+    return {
+        "Content-Type": content_type,
+        "Host": host,
+        "X-Date": x_date,
+        "X-Content-Sha256": payload_hash,
+        "Authorization": authorization,
+    }
+
+async def volcengine_ark_asset_call(client, action: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    """调用一次火山 Ark Assets OpenAPI，返回 Result 内容；出错抛 HTTPException。"""
+    ak = volcengine_access_key_value()
+    sk = volcengine_secret_key_value()
+    if not ak or not sk:
+        raise HTTPException(status_code=400, detail="未配置火山引擎 AK/SK，请在 API 设置中填写 Access Key ID / Secret Access Key。")
+    body_str = json.dumps(body, ensure_ascii=False)
+    headers = volcengine_sign_v4_headers(ak, sk, action, body_str)
+    url = f"https://{VOLCENGINE_ARK_ASSET_HOST}/?Action={urllib.parse.quote(action, safe='')}&Version={urllib.parse.quote(VOLCENGINE_ARK_ASSET_VERSION, safe='')}"
+    resp = await client.post(url, headers=headers, content=body_str.encode("utf-8"), timeout=120)
+    try:
+        payload = resp.json()
+    except Exception:
+        raise HTTPException(status_code=502, detail=f"火山 {action} 返回非 JSON（{resp.status_code}）：{resp.text[:300]}")
+    meta = payload.get("ResponseMetadata") if isinstance(payload, dict) else None
+    if isinstance(meta, dict) and isinstance(meta.get("Error"), dict):
+        err = meta["Error"]
+        code = err.get("Code") or err.get("CodeN") or ""
+        msg = err.get("Message") or ""
+        raise HTTPException(status_code=502, detail=f"火山 {action} 失败：{code} {msg}".strip())
+    if resp.status_code not in (200, 201):
+        raise HTTPException(status_code=502, detail=f"火山 {action} 失败（{resp.status_code}）：{resp.text[:300]}")
+    result = payload.get("Result") if isinstance(payload, dict) and isinstance(payload.get("Result"), dict) else None
+    return result if result is not None else (payload if isinstance(payload, dict) else {})
+
+async def volcengine_ensure_asset_group(client, project_name: str, group_name: str) -> str:
+    """复用同名素材组合，没有则新建。返回 GroupId。"""
+    name = (group_name or "可信素材").strip()[:60] or "可信素材"
+    project_name = (project_name or "default").strip() or "default"
+    # 先按 Name 模糊查找复用
+    try:
+        listed = await volcengine_ark_asset_call(client, "ListAssetGroups", {
+            "Filter": {"Name": name, "GroupType": "AIGC"},
+            "PageNumber": 1, "PageSize": 10, "ProjectName": project_name,
+        })
+        for item in (listed.get("Items") or []):
+            if str(item.get("Name") or "").strip() == name and str(item.get("ProjectName") or "default") == project_name:
+                gid = str(item.get("Id") or "").strip()
+                if gid:
+                    return gid
+    except HTTPException:
+        pass  # 查询失败不致命，继续走新建
+    created = await volcengine_ark_asset_call(client, "CreateAssetGroup", {
+        "Name": name, "Description": name, "ProjectName": project_name,
+    })
+    gid = str(created.get("Id") or "").strip()
+    if not gid:
+        raise HTTPException(status_code=502, detail=f"火山 CreateAssetGroup 未返回 GroupId：{str(created)[:200]}")
+    return gid
+
+async def submit_volcengine_avatar_asset(public_url: str, name: str, kind: str,
+                                         project_name: str = "default", group_name: str = "") -> str:
+    """把公网可访问素材提交到火山 Ark 私域素材库（异步）。返回 Asset Id 作为任务 ID。"""
+    async with httpx.AsyncClient(timeout=120) as client:
+        group_id = await volcengine_ensure_asset_group(client, project_name, group_name)
+        created = await volcengine_ark_asset_call(client, "CreateAsset", {
+            "GroupId": group_id,
+            "URL": public_url,
+            "AssetType": apimart_avatar_asset_type(kind),
+            "Name": (name or "asset")[:60],
+            "ProjectName": (project_name or "default").strip() or "default",
+        })
+    asset_id = str(created.get("Id") or "").strip()
+    if not asset_id:
+        raise HTTPException(status_code=502, detail=f"火山 CreateAsset 未返回 Asset Id：{str(created)[:200]}")
+    return asset_id
+
+async def check_volcengine_avatar_task(asset_id: str, project_name: str = "default") -> Dict[str, Any]:
+    """查询一次火山素材状态。返回 {status: Active/Processing/Failed, asset_uri, detail}。"""
+    async with httpx.AsyncClient(timeout=60) as client:
+        info = await volcengine_ark_asset_call(client, "GetAsset", {
+            "Id": asset_id,
+            "ProjectName": (project_name or "default").strip() or "default",
+        })
+    status = str(info.get("Status") or "").strip()
+    if status == "Active":
+        return {"status": "Active", "asset_uri": f"asset://{asset_id}", "detail": ""}
+    if status == "Failed":
+        return {"status": "Failed", "asset_uri": "", "detail": "火山素材处理失败，无法用于推理。"}
+    return {"status": "Processing", "asset_uri": "", "detail": "火山素材处理中"}
+
+def volcengine_public_asset_url(url: str) -> str:
+    """火山 CreateAsset 要求 URL 公网可访问；本地文件需 PUBLIC_BASE_URL，否则返回 ERR:。"""
+    text = str(url or "").strip()
+    if text.startswith("http://") or text.startswith("https://"):
+        return text
+    public = local_asset_public_url(text)
+    if public:
+        return public
+    return "ERR:火山要求素材是公网可访问的 http/https URL；本地画布文件需配置 PUBLIC_BASE_URL/PUBLIC_MEDIA_BASE_URL 暴露为公网地址。"
 
 def local_media_path_for_cloud_upload(ref_url: str, allowed_prefixes=("image/", "video/")) -> str:
     ref_url = str(ref_url or "").strip()
@@ -5826,11 +6390,141 @@ async def jimeng_status():
     exe = jimeng_cli_executable()
     if not exe:
         return {"installed": False, "logged_in": False, "message": "未找到 dreamina CLI"}
+    version, version_text = await jimeng_cli_version()
+    version_str = ".".join(str(part) for part in version) if version else None
+    version_ok = version >= JIMENG_MIN_CLI_VERSION if version else None
+    min_version_str = ".".join(str(part) for part in JIMENG_MIN_CLI_VERSION)
     try:
         raw = await run_jimeng_cli(["user_credit"], timeout=30)
-        return {"installed": True, "logged_in": True, "raw": raw}
+        return {
+            "installed": True,
+            "logged_in": True,
+            "raw": raw,
+            "cli_version": version_str,
+            "version_ok": version_ok,
+            "min_version": min_version_str,
+        }
     except HTTPException as exc:
-        return {"installed": True, "logged_in": False, "message": str(exc.detail)}
+        return {
+            "installed": True,
+            "logged_in": False,
+            "message": str(exc.detail),
+            "cli_version": version_str,
+            "version_ok": version_ok,
+            "min_version": min_version_str,
+        }
+
+@app.get("/api/jimeng/credit")
+async def jimeng_credit():
+    raw = await run_jimeng_cli(["user_credit"], timeout=30)
+    return {"success": True, "raw": raw}
+
+@app.post("/api/jimeng/logout")
+async def jimeng_logout():
+    raw = await run_jimeng_cli(["logout"], timeout=30)
+    return {"success": True, "raw": raw}
+
+@app.post("/api/jimeng/login/start")
+async def jimeng_login_start():
+    old_proc = JIMENG_LOGIN_SESSION.get("proc")
+    if old_proc and getattr(old_proc, "returncode", None) is None:
+        try:
+            old_proc.terminate()
+        except Exception:
+            pass
+    exe = jimeng_cli_executable()
+    if not exe:
+        raise HTTPException(status_code=400, detail="未找到 dreamina CLI")
+    JIMENG_LOGIN_SESSION.update({"proc": None, "stdout": "", "stderr": "", "started_at": time.time()})
+    args = ["login", "--headless"]
+    command = jimeng_command(args, exe)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=BASE_DIR,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=400, detail=f"未找到即梦 CLI：{exe}") from exc
+    JIMENG_LOGIN_SESSION["proc"] = proc
+    asyncio.create_task(jimeng_login_reader(proc))
+    await asyncio.sleep(2)
+    text = jimeng_login_text()
+    if proc.returncode not in (None, 0) and ("unknown" in text.lower() or "no such option" in text.lower()):
+        # 旧版 CLI 可能没有 --headless，退回 debug 输出。
+        JIMENG_LOGIN_SESSION.update({"proc": None, "stdout": "", "stderr": "", "started_at": time.time()})
+        proc = await asyncio.create_subprocess_exec(
+            *jimeng_command(["login", "--debug"], exe),
+            cwd=BASE_DIR,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        JIMENG_LOGIN_SESSION["proc"] = proc
+        asyncio.create_task(jimeng_login_reader(proc))
+        await asyncio.sleep(2)
+        text = jimeng_login_text()
+    return {
+        "success": True,
+        "running": JIMENG_LOGIN_SESSION.get("proc") is not None and JIMENG_LOGIN_SESSION["proc"].returncode is None,
+        "text": text,
+        "qr_url": jimeng_login_qr_from_text(text),
+        "started_at": JIMENG_LOGIN_SESSION.get("started_at") or 0,
+    }
+
+@app.get("/api/jimeng/login/status")
+async def jimeng_login_status():
+    proc = JIMENG_LOGIN_SESSION.get("proc")
+    text = jimeng_login_text()
+    running = proc is not None and getattr(proc, "returncode", None) is None
+    logged_in = False
+    credit_raw = None
+    if not running:
+        try:
+            credit_raw = await run_jimeng_cli(["user_credit"], timeout=20)
+            logged_in = True
+        except HTTPException:
+            logged_in = False
+    return {
+        "success": True,
+        "running": running,
+        "logged_in": logged_in,
+        "text": text,
+        "qr_url": jimeng_login_qr_from_text(text),
+        "raw": credit_raw,
+    }
+
+@app.post("/api/jimeng/help")
+async def jimeng_help(payload: JimengHelpRequest):
+    command = str(payload.command or "").strip()
+    allowed = {"", "login", "logout", "user_credit", "text2image", "image2image", "image_upscale", "text2video", "image2video", "multimodal2video", "frames2video", "multiframe2video", "list_task", "query_result"}
+    if command not in allowed:
+        raise HTTPException(status_code=400, detail="不支持的帮助命令")
+    args = [command, "-h"] if command else ["-h"]
+    raw = await run_jimeng_cli(args, timeout=30, raw_text=True)
+    text = raw.get("_stdout") or ""
+    if raw.get("_stderr"):
+        text = f"{text}\n{raw.get('_stderr')}".strip()
+    return {"success": True, "command": command, "text": text, "raw": raw}
+
+@app.post("/api/jimeng/query-media")
+async def jimeng_query_media(payload: JimengQueryMediaRequest):
+    """按 submit_id 续查即梦任务：出图返回 succeeded+urls；仍排队返回 pending+queue_info；失败返回 failed。
+    供画布「排队中」卡片自动轮询与手动查询复用。"""
+    submit_id = str(payload.submit_id or "").strip()
+    if not submit_id:
+        raise HTTPException(status_code=400, detail="缺少 submit_id")
+    kind = str(payload.kind or "image").strip().lower()
+    if kind not in ("image", "video", "audio"):
+        kind = "image"
+    queried = await jimeng_query_result(submit_id, kind)
+    try:
+        urls = await jimeng_store_outputs(queried, kind, allow_query=False)
+        return {"status": "succeeded", "submit_id": submit_id, "kind": kind, "urls": urls}
+    except JimengPendingError as exc:
+        return {"status": "pending", "submit_id": submit_id, "kind": kind, "queue_info": exc.queue_info, "message": jimeng_pending_payload(exc)["message"]}
+    except HTTPException as exc:
+        return {"status": "failed", "submit_id": submit_id, "kind": kind, "error": str(getattr(exc, "detail", "") or exc)}
 
 @app.get("/api/config")
 async def ai_config():
@@ -6222,6 +6916,20 @@ async def run_canvas_image_task(task_id: str, payload: OnlineImageRequest):
                 "error": "",
                 "updated_at": time.time(),
             })
+    except JimengPendingError as exc:
+        # 即梦云端还在排队：标记为 jimeng_pending，前端据 submit_id 持久续查（任务未丢失）
+        info = jimeng_pending_payload(exc)
+        with CANVAS_TASK_LOCK:
+            CANVAS_TASKS[task_id].update({
+                "status": "jimeng_pending",
+                "jimeng_pending": True,
+                "submit_id": exc.submit_id,
+                "kind": exc.kind,
+                "queue_info": exc.queue_info,
+                "message": info["message"],
+                "error": "",
+                "updated_at": time.time(),
+            })
     except Exception as exc:
         detail = getattr(exc, "detail", None) or str(exc)
         status_code = getattr(exc, "status_code", 500)
@@ -6539,6 +7247,28 @@ async def canvas_video(payload: CanvasVideoRequest):
                         body["image_urls"] = image_payload[:9]
                     if video_payload:
                         body["video_urls"] = video_payload
+                    audio_payload = []
+                    invalid_audios = []
+                    for ref_url in (payload.audios or [])[:3]:
+                        ref_url = str(ref_url or "").strip()
+                        if not ref_url:
+                            continue
+                        normalized_audio_url = await upload_audio_for_apimart(client, provider, ref_url)
+                        if valid_apimart_video_image_input(normalized_audio_url):
+                            audio_payload.append(normalized_audio_url)
+                        else:
+                            reason = normalized_audio_url[4:] if isinstance(normalized_audio_url, str) and normalized_audio_url.startswith("ERR:") else "未知错误"
+                            invalid_audios.append((ref_url, reason))
+                    if invalid_audios:
+                        first_url, first_reason = invalid_audios[0]
+                        raise HTTPException(status_code=400, detail=f"参考音频无法转换为 APIMart 支持的地址：{invalid_video_image_preview(first_url)}\n原因：{first_reason}")
+                    if audio_payload:
+                        body["audio_urls"] = audio_payload
+                    if payload.trusted_asset:
+                        img_count = len(body.get("image_urls") or []) or len(image_with_roles)
+                        body["prompt"] = apply_trusted_asset_prompt_index(
+                            body["prompt"], img_count, len(video_payload), len(audio_payload)
+                        )
                     if payload.seed is not None:
                         body["seed"] = payload.seed
                     if payload.return_last_frame:
@@ -6574,6 +7304,7 @@ async def canvas_video(payload: CanvasVideoRequest):
                     if payload.camerafixed:
                         body["camerafixed"] = True
                     image_like_urls = set()
+                    volc_video_count = 0
                     for ref in payload.images[:9]:
                         url = volcengine_media_reference_url(ref.url, max_image_size=1536)
                         if not url:
@@ -6604,6 +7335,11 @@ async def canvas_video(payload: CanvasVideoRequest):
                             continue
                         video_items = await volcengine_video_reference_content_items(media_url)
                         body["content"].extend(video_items)
+                        volc_video_count += 1
+                    if payload.trusted_asset and body["content"] and body["content"][0].get("type") == "text":
+                        body["content"][0]["text"] = apply_trusted_asset_prompt_index(
+                            body["content"][0].get("text") or "", len(image_like_urls), volc_video_count, 0
+                        )
                     if payload.seed is not None:
                         body["seed"] = payload.seed
                 else:
@@ -7241,6 +7977,103 @@ async def rename_asset_library_item(item_id: str, payload: AssetLibraryRenameReq
                     save_asset_library(lib)
                     return {"library": lib, "item": item}
     raise HTTPException(status_code=404, detail="资产不存在")
+
+def find_asset_item_in_library(lib, item_id, library_id=""):
+    for library in lib.get("libraries", []):
+        if library_id and library.get("id") != library_id:
+            continue
+        for cat in library.get("categories", []):
+            for item in cat.get("items", []):
+                if item.get("id") == item_id:
+                    return item
+    return None
+
+@app.post("/api/asset-library/items/{item_id}/register-avatar")
+async def register_asset_library_avatar(item_id: str, payload: AssetAvatarRegisterRequest):
+    lib = load_asset_library()
+    target_item = find_asset_item_in_library(lib, item_id, payload.library_id)
+    if not target_item:
+        raise HTTPException(status_code=404, detail="资产不存在")
+    provider = get_api_provider(payload.provider_id)
+    platform = avatar_platform_for_provider(provider)
+    if platform not in AVATAR_SUPPORTED_PLATFORMS:
+        name = (provider or {}).get("name") or (provider or {}).get("id") or "该平台"
+        raise HTTPException(status_code=400, detail=f"「{name}」暂不支持数字人/真人认证（目前仅 APIMart 可用，火山等平台待接入官方资产 API）。")
+    kind = str(target_item.get("kind") or "image").lower()
+    if kind not in ("image", "video", "audio"):
+        kind = "image"
+    if platform == "apimart":
+        project_name = str(payload.project_name or "default").strip() or "default"
+        async with httpx.AsyncClient(timeout=VIDEO_POLL_TIMEOUT) as client:
+            public_url = await upload_media_for_apimart(client, provider, target_item.get("url") or "", kind)
+        if not valid_apimart_video_image_input(public_url):
+            reason = public_url[4:] if isinstance(public_url, str) and public_url.startswith("ERR:") else "无法获取公网可访问地址"
+            raise HTTPException(status_code=400, detail=f"素材无法提交到 APIMart：{reason}\n请配置 PUBLIC_BASE_URL，或确认本地文件存在。")
+        task_id = await submit_apimart_avatar_asset(
+            provider, public_url, target_item.get("name") or "asset", kind,
+            project_name=project_name, group_name=payload.group_name,
+        )
+    elif platform == "volcengine":
+        # 火山以 API 设置里配置的 ProjectName 为准（必须与视频生成 key 的项目一致）
+        project_name = str(provider.get("volcengine_project_name") or VOLCENGINE_DEFAULT_PROJECT_NAME).strip() or VOLCENGINE_DEFAULT_PROJECT_NAME
+        public_url = volcengine_public_asset_url(target_item.get("url") or "")
+        if public_url.startswith("ERR:"):
+            raise HTTPException(status_code=400, detail=public_url[4:])
+        task_id = await submit_volcengine_avatar_asset(
+            public_url, target_item.get("name") or "asset", kind,
+            project_name=project_name, group_name=payload.group_name or "",
+        )
+    else:
+        raise HTTPException(status_code=400, detail="该平台的认证后端尚未接入。")
+    regs = target_item.get("registrations")
+    if not isinstance(regs, dict):
+        regs = {}
+    regs[platform] = {
+        "provider_id": provider["id"],
+        "project_name": project_name,
+        "task_id": task_id,
+        "status": "Processing",
+        "detail": "已提交，审核中",
+        "asset_uri": "",
+        "asset_id": "",
+        "registered_at": now_ms(),
+    }
+    target_item["registrations"] = regs
+    save_asset_library(lib)
+    return {"library": lib, "item": target_item}
+
+@app.post("/api/asset-library/items/{item_id}/avatar-status")
+async def check_asset_library_avatar(item_id: str, payload: AssetAvatarRegisterRequest):
+    lib = load_asset_library()
+    target_item = find_asset_item_in_library(lib, item_id, payload.library_id)
+    if not target_item:
+        raise HTTPException(status_code=404, detail="资产不存在")
+    regs = target_item.get("registrations") if isinstance(target_item.get("registrations"), dict) else {}
+    provider = get_api_provider(payload.provider_id or "")
+    platform = avatar_platform_for_provider(provider)
+    if platform not in AVATAR_SUPPORTED_PLATFORMS:
+        raise HTTPException(status_code=400, detail="该平台暂不支持数字人/真人认证审核。")
+    reg = regs.get(platform) if isinstance(regs.get(platform), dict) else {}
+    task_id = str(reg.get("task_id") or "").strip()
+    if not task_id:
+        raise HTTPException(status_code=400, detail="该素材还没有提交到这个平台的认证审核。")
+    if platform == "apimart":
+        result = await check_apimart_avatar_task(provider, task_id)
+    elif platform == "volcengine":
+        result = await check_volcengine_avatar_task(
+            task_id, str(reg.get("project_name") or VOLCENGINE_DEFAULT_PROJECT_NAME).strip() or VOLCENGINE_DEFAULT_PROJECT_NAME,
+        )
+    else:
+        raise HTTPException(status_code=400, detail="该平台的认证后端尚未接入。")
+    reg["status"] = result["status"]
+    reg["detail"] = result.get("detail") or ""
+    if result["status"] == "Active" and result.get("asset_uri"):
+        reg["asset_uri"] = result["asset_uri"]
+        reg["asset_id"] = result["asset_uri"].replace("asset://", "")
+    regs[platform] = reg
+    target_item["registrations"] = regs
+    save_asset_library(lib)
+    return {"library": lib, "item": target_item}
 
 @app.delete("/api/asset-library/items/{item_id}")
 async def delete_asset_library_item(item_id: str):
