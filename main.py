@@ -13,6 +13,7 @@ import random
 import sys
 import subprocess
 import time
+import traceback
 import shutil
 import asyncio
 import logging
@@ -24,7 +25,7 @@ import math
 import shlex
 import functools
 from typing import List, Dict, Any, Optional, Tuple
-from threading import Lock
+from threading import Lock, Thread
 import httpx
 from PIL import Image
 from io import BytesIO
@@ -158,11 +159,18 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 GLOBAL_LOOP = None
-APP_VERSION = "2026.05.19"
+APP_VERSION = "2026.06.03"
 GITHUB_REPO_URL = "https://github.com/hero8152/Infinite-Canvas"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/hero8152/Infinite-Canvas/main/VERSION"
 GITHUB_TREE_URL = "https://api.github.com/repos/hero8152/Infinite-Canvas/git/trees/main?recursive=1"
 GITHUB_RAW_ROOT = "https://raw.githubusercontent.com/hero8152/Infinite-Canvas/main"
+MODELSCOPE_REPO_URL = "https://modelscope.ai/studios/daniel8152/Infinite-Canvas"
+MODELSCOPE_RAW_ROOT = "https://www.modelscope.ai/studios/daniel8152/Infinite-Canvas/raw/main"
+# ModelScope 仓库默认分支为 master；raw 网页路径会返回 HTML，必须用仓库文件 API 才能拿到纯文本
+# 注意：.ai 站命名空间为小写 daniel8152，API 路径大小写敏感（推送/文件 API 用大写会 404/拒绝）
+MODELSCOPE_FILE_API_ROOT = "https://www.modelscope.ai/api/v1/studio/daniel8152/Infinite-Canvas/repo?Revision=master&FilePath="
+MODELSCOPE_VERSION_URL = MODELSCOPE_FILE_API_ROOT + "VERSION"
+MODELSCOPE_TREE_URL = "https://www.modelscope.ai/api/v1/studio/daniel8152/Infinite-Canvas/repo/files?Revision=master&Recursive=true"
 
 @app.on_event("startup")
 async def startup_event():
@@ -199,6 +207,7 @@ ASSETS_DIR = os.path.join(BASE_DIR, "assets")
 OUTPUT_INPUT_DIR = os.path.join(ASSETS_DIR, "input")
 OUTPUT_OUTPUT_DIR = os.path.join(ASSETS_DIR, "output")
 ASSET_LIBRARY_DIR = os.path.join(ASSETS_DIR, "library")
+LOCAL_UPLOAD_DIR = os.path.join(ASSETS_DIR, "uploads")
 HISTORY_FILE = os.path.join(BASE_DIR, "history.json")
 API_ENV_FILE = os.path.join(BASE_DIR, "API", ".env")
 DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -208,6 +217,7 @@ ASSET_LIBRARY_PATH = os.path.join(DATA_DIR, "asset_library.json")
 PROMPT_LIBRARY_PATH = os.path.join(DATA_DIR, "prompt_libraries.json")
 API_PROVIDERS_FILE = os.path.join(DATA_DIR, "api_providers.json")
 RUNNINGHUB_WORKFLOW_STORE_FILE = os.path.join(DATA_DIR, "runninghub_workflows.json")
+SHARED_FOLDERS_FILE = os.path.join(DATA_DIR, "shared_folders.json")
 GLOBAL_CONFIG_FILE = os.path.join(BASE_DIR, "global_config.json")
 CANVAS_TRASH_RETENTION_MS = 30 * 24 * 60 * 60 * 1000
 LOCAL_IMAGE_IMPORT_MAX_BYTES = int(os.getenv("LOCAL_IMAGE_IMPORT_MAX_BYTES", str(50 * 1024 * 1024)))
@@ -912,6 +922,28 @@ def apply_runninghub_system_thumbnails(entries, kind):
         result.append(entry)
     return result
 
+def merge_runninghub_entry_overlay(system_entry, user_entry):
+    # 用户条目优先，但当它把 fields/workflowJson 留空（例如配置前生成的空壳）时，
+    # 继承系统模板里的完整配置，否则模板里的必选/可选等设置会被空壳覆盖丢失。
+    if not isinstance(system_entry, dict):
+        return user_entry
+    if not isinstance(user_entry, dict):
+        return system_entry
+    merged = dict(user_entry)
+    user_fields = user_entry.get("fields")
+    sys_fields = system_entry.get("fields")
+    if not (isinstance(user_fields, list) and user_fields) and isinstance(sys_fields, list) and sys_fields:
+        merged["fields"] = sys_fields
+    user_wj = user_entry.get("workflowJson")
+    sys_wj = system_entry.get("workflowJson")
+    if not (isinstance(user_wj, dict) and user_wj) and isinstance(sys_wj, dict) and sys_wj:
+        merged["workflowJson"] = sys_wj
+    if not user_entry.get("optionalImageMode") and system_entry.get("optionalImageMode"):
+        merged["optionalImageMode"] = system_entry["optionalImageMode"]
+    if not (isinstance(user_entry.get("raw"), dict) and user_entry.get("raw")) and isinstance(system_entry.get("raw"), dict) and system_entry.get("raw"):
+        merged["raw"] = system_entry["raw"]
+    return merged
+
 def merge_runninghub_system_entries(system_entries, user_entries, kind):
     merged = []
     index = {}
@@ -933,7 +965,7 @@ def merge_runninghub_system_entries(system_entries, user_entries, kind):
                 index = {runninghub_entry_id(item, kind): idx for idx, item in enumerate(merged)}
             continue
         if entry_id in index:
-            merged[index[entry_id]] = entry
+            merged[index[entry_id]] = merge_runninghub_entry_overlay(merged[index[entry_id]], entry)
         else:
             index[entry_id] = len(merged)
             merged.append(entry)
@@ -1216,6 +1248,7 @@ os.makedirs(ASSETS_DIR, exist_ok=True)
 os.makedirs(OUTPUT_INPUT_DIR, exist_ok=True)
 os.makedirs(OUTPUT_OUTPUT_DIR, exist_ok=True)
 os.makedirs(ASSET_LIBRARY_DIR, exist_ok=True)
+os.makedirs(LOCAL_UPLOAD_DIR, exist_ok=True)
 os.makedirs(STATIC_DIR, exist_ok=True)
 os.makedirs(WORKFLOW_DIR, exist_ok=True)
 os.makedirs(CONVERSATION_DIR, exist_ok=True)
@@ -1257,17 +1290,25 @@ def sync_static_html_versions():
     safe_version = urllib.parse.quote(version, safe="._-")
     try:
         for name in os.listdir(STATIC_DIR):
+            # 跳过 macOS 在外置硬盘(ExFAT/NTFS)生成的 ._* Apple Double 元数据文件，
+            # 这些是二进制文件，按 UTF-8 读取会抛 UnicodeDecodeError。
+            if name.startswith("._"):
+                continue
             if not name.lower().endswith(".html"):
                 continue
             path = os.path.join(STATIC_DIR, name)
             if not os.path.isfile(path):
                 continue
-            with open(path, "r", encoding="utf-8") as f:
-                old = f.read()
-            new = re.sub(r'([?&]v=)[^"\'`\s<>)]*', rf'\g<1>{safe_version}', old)
-            if new != old:
-                with open(path, "w", encoding="utf-8", newline="") as f:
-                    f.write(new)
+            # 单文件容错：某个文件读写失败不应中断整批同步。
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    old = f.read()
+                new = re.sub(r'([?&]v=)[^"\'`\s<>)]*', rf'\g<1>{safe_version}', old)
+                if new != old:
+                    with open(path, "w", encoding="utf-8", newline="") as f:
+                        f.write(new)
+            except Exception as e:
+                print(f"同步静态页面版本号失败({name}): {e}")
     except Exception as e:
         print(f"同步静态页面版本号失败: {e}")
 
@@ -1396,9 +1437,23 @@ def app_info():
         "repo_url": GITHUB_REPO_URL,
         "version_url": GITHUB_VERSION_URL,
         "tree_url": GITHUB_TREE_URL,
+        "sources": {
+            "github": {
+                "label": "GitHub",
+                "repo_url": GITHUB_REPO_URL,
+                "version_url": GITHUB_VERSION_URL,
+                "tree_url": GITHUB_TREE_URL,
+            },
+            "modelscope": {
+                "label": "ModelScope",
+                "repo_url": MODELSCOPE_REPO_URL,
+                "version_url": MODELSCOPE_VERSION_URL,
+                "tree_url": MODELSCOPE_TREE_URL,
+            },
+        },
     }
 
-def connectivity_probe(name: str, url: str, timeout: float = 8.0) -> Dict[str, Any]:
+def connectivity_probe(name: str, url: str, timeout: float = 5.0) -> Dict[str, Any]:
     started = time.time()
     item = {
         "name": name,
@@ -1407,6 +1462,7 @@ def connectivity_probe(name: str, url: str, timeout: float = 8.0) -> Dict[str, A
         "status": 0,
         "elapsed_ms": 0,
         "error": "",
+        "timed_out": False,
     }
     try:
         response = requests.get(
@@ -1421,26 +1477,133 @@ def connectivity_probe(name: str, url: str, timeout: float = 8.0) -> Dict[str, A
         if not item["ok"]:
             item["error"] = f"HTTP {response.status_code} {response.reason}"
         response.close()
+    except requests.Timeout:
+        item["timed_out"] = True
+        item["error"] = f"连接超时（超过 {timeout:g}s）"
     except requests.RequestException as exc:
         item["error"] = str(exc)
     finally:
         item["elapsed_ms"] = int((time.time() - started) * 1000)
     return item
 
+def update_connectivity_targets() -> List[Tuple[str, str, str, bool]]:
+    return [
+        ("GitHub 更新列表", GITHUB_TREE_URL, "github", True),
+        ("GitHub 版本文件", GITHUB_VERSION_URL, "github", True),
+        ("GitHub 主页", "https://github.com/", "github", False),
+        ("ModelScope 版本文件", MODELSCOPE_VERSION_URL, "modelscope", True),
+        ("ModelScope 空间页面", MODELSCOPE_REPO_URL, "modelscope", False),
+        ("ModelScope 主页", "https://modelscope.cn/", "modelscope", False),
+        ("Google 连通性", "https://www.google.com/generate_204", "reference", False),
+    ]
+
+@app.get("/api/update-connectivity/probe")
+def update_connectivity_probe(name: str):
+    """实时检测：只探测单个目标，前端可并发调用并逐条刷新。"""
+    for t_name, url, source, required in update_connectivity_targets():
+        if t_name == name:
+            item = connectivity_probe(t_name, url)
+            item["source"] = source
+            item["required"] = required
+            return item
+    raise HTTPException(status_code=404, detail="未知的连通性检测目标")
+
 @app.get("/api/update-connectivity")
 def update_connectivity():
-    targets = [
-        ("GitHub 更新列表", GITHUB_TREE_URL),
-        ("GitHub 版本文件", GITHUB_VERSION_URL),
-        ("GitHub 主页", "https://github.com/"),
-        ("Google 连通性", "https://www.google.com/generate_204"),
-    ]
-    results = [connectivity_probe(name, url) for name, url in targets]
+    targets = update_connectivity_targets()
+    results = []
+    for name, url, source, required in targets:
+        item = connectivity_probe(name, url)
+        item["source"] = source
+        item["required"] = required
+        results.append(item)
+    sources = {}
+    for source in ("github", "modelscope"):
+        source_required = [item for item in results if item.get("source") == source and item.get("required")]
+        sources[source] = {
+            "ok": all(item["ok"] for item in source_required),
+            "required": [item["name"] for item in source_required],
+        }
     return {
-        "ok": all(item["ok"] for item in results[:2]),
+        "ok": sources["github"]["ok"],
         "results": results,
-        "required": ["GitHub 更新列表", "GitHub 版本文件"],
-        "optional": ["GitHub 主页", "Google 连通性"],
+        "sources": sources,
+        "required": sources["github"]["required"],
+        "optional": ["GitHub 主页", "ModelScope 空间页面", "ModelScope 主页", "Google 连通性"],
+    }
+
+def fetch_remote_version(url: str, timeout: float = 5.0) -> Dict[str, Any]:
+    info: Dict[str, Any] = {"version": "", "ok": False, "error": "", "url": url}
+    if not url:
+        info["error"] = "missing url"
+        return info
+    try:
+        resp = requests.get(
+            f"{url}{'&' if '?' in url else '?'}t={int(time.time())}",
+            headers={"User-Agent": "Infinite-Canvas-Updater"},
+            timeout=timeout,
+            proxies=urllib.request.getproxies() or None,
+        )
+        if 200 <= resp.status_code < 400:
+            text = resp.content.decode("utf-8", errors="replace").strip()
+            version = text.splitlines()[0].strip() if text else ""
+            # 防御：raw 网页/错误页会返回 HTML 或 JSON，必须长得像版本号（含数字、无尖括号/花括号）
+            if version and "<" not in version and "{" not in version and re.search(r"\d", version):
+                info["version"] = version
+                info["ok"] = True
+            elif not version:
+                info["error"] = "空版本文件"
+            else:
+                info["error"] = "版本文件格式异常"
+        else:
+            info["error"] = f"HTTP {resp.status_code}"
+    except requests.RequestException as exc:
+        info["error"] = str(exc)
+    return info
+
+def version_tuple(value: str) -> List[int]:
+    return [int(x) for x in re.findall(r"\d+", str(value or ""))]
+
+def version_gt(a: str, b: str) -> bool:
+    ta, tb = version_tuple(a), version_tuple(b)
+    n = max(len(ta), len(tb))
+    ta += [0] * (n - len(ta))
+    tb += [0] * (n - len(tb))
+    return ta > tb
+
+@app.get("/api/check-update")
+def check_update():
+    """服务端检测 GitHub 与 ModelScope 两个源的远端版本（走系统代理，避免浏览器跨域/被墙）。"""
+    current = current_app_version()
+    # 并发检测两个源，避免串行 8s+8s 拖慢首屏更新提示
+    holder: Dict[str, Dict[str, Any]] = {}
+    def _probe(key: str, url: str):
+        item = fetch_remote_version(url, timeout=5.0)
+        item["source"] = key
+        holder[key] = item
+    threads = [
+        Thread(target=_probe, args=("github", GITHUB_VERSION_URL), daemon=True),
+        Thread(target=_probe, args=("modelscope", MODELSCOPE_VERSION_URL), daemon=True),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5.5)
+    github = holder.get("github") or {"version": "", "ok": False, "error": "检测超时（超过 5s）", "url": GITHUB_VERSION_URL, "source": "github"}
+    modelscope = holder.get("modelscope") or {"version": "", "ok": False, "error": "检测超时（超过 5s）", "url": MODELSCOPE_VERSION_URL, "source": "modelscope"}
+    best: Dict[str, Any] = {}
+    for item in (github, modelscope):
+        if item["ok"] and item["version"]:
+            if not best or version_gt(item["version"], best["version"]):
+                best = {"source": item["source"], "version": item["version"]}
+    update_available = bool(best and version_gt(best["version"], current))
+    return {
+        "current": current,
+        "github": github,
+        "modelscope": modelscope,
+        "latest": best,
+        "update_available": update_available,
+        "reachable": bool(github["ok"] or modelscope["ok"]),
     }
 
 def update_allowed_file(path: str) -> bool:
@@ -1511,6 +1674,49 @@ def download_github_update_files(files: List[str], staging_root: str) -> None:
         os.makedirs(os.path.dirname(stage_path), exist_ok=True)
         with open(stage_path, "wb") as f:
             f.write(data)
+
+def modelscope_update_file_list() -> List[str]:
+    """通过 ModelScope 仓库文件 API 列出所有允许更新的文件（不依赖 git）。"""
+    resp = github_get(MODELSCOPE_TREE_URL, headers={"User-Agent": "Infinite-Canvas-Updater"}, timeout=30)
+    payload = json.loads(resp.content.decode("utf-8", errors="replace"))
+    files_node = ((payload.get("Data") or {}).get("Files")) or []
+    out: List[str] = []
+    for entry in files_node:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("Type") != "blob":
+            continue
+        path = str(entry.get("Path") or "").replace("\\", "/")
+        if update_allowed_file(path):
+            out.append(path)
+    return sorted(set(out))
+
+def modelscope_file_bytes(rel: str) -> bytes:
+    url = MODELSCOPE_FILE_API_ROOT + urllib.parse.quote(rel, safe="/")
+    resp = github_get(url, headers={"User-Agent": "Infinite-Canvas-Updater"}, timeout=60)
+    return resp.content
+
+def download_modelscope_update_files(staging_root: str) -> List[str]:
+    # 用 HTTP 仓库文件 API 下载（与 GitHub raw 同样思路），不依赖本机安装 Git。
+    # 之前用 git clone 会要求目标机装 Git for Windows，很多用户没装 → 一键更新失败。
+    files = modelscope_update_file_list()
+    if not files:
+        raise RuntimeError("ModelScope 未返回任何文件")
+    if "main.py" not in files or "VERSION" not in files:
+        raise RuntimeError("ModelScope 更新源缺少 main.py 或 VERSION")
+    if not any(f.startswith("static/") for f in files):
+        raise RuntimeError("ModelScope 未返回 static 文件，已取消更新")
+    staging_root_abs = os.path.abspath(staging_root)
+    for rel in files:
+        safe_update_target(rel)
+        data = modelscope_file_bytes(rel)
+        stage_path = os.path.abspath(os.path.join(staging_root_abs, *rel.split("/")))
+        if os.path.commonpath([staging_root_abs, stage_path]) != staging_root_abs:
+            raise ValueError(f"更新暂存路径不安全：{rel}")
+        os.makedirs(os.path.dirname(stage_path), exist_ok=True)
+        with open(stage_path, "wb") as f:
+            f.write(data)
+    return files
 
 def safe_update_target(path: str) -> str:
     rel = str(path or "").replace("\\", "/").lstrip("/")
@@ -1607,37 +1813,117 @@ def schedule_self_restart(delay_seconds: int = 3) -> bool:
 class UpdateRequest(BaseModel):
     auto_restart: bool = False
     restart_delay: int = 3
+    source: str = "github"
+    fallback: bool = True
+
+def github_update_file_list() -> Tuple[List[str], List[str], List[str]]:
+    tree_data = github_json(GITHUB_TREE_URL, use_etag_cache=True)
+    entries = tree_data.get("tree") or []
+    static_files = []
+    root_files = []
+    for entry in entries:
+        path = str(entry.get("path") or "").replace("\\", "/")
+        if entry.get("type") == "blob" and update_allowed_file(path):
+            if path.startswith("static/"):
+                static_files.append(path)
+            else:
+                root_files.append(path)
+    if "main.py" not in root_files:
+        root_files.append("main.py")
+    if "VERSION" not in root_files:
+        root_files.append("VERSION")
+    static_files = sorted(set(static_files))
+    root_files = sorted(set(root_files))
+    files = root_files + static_files
+    if not static_files:
+        raise RuntimeError("GitHub 未返回 static 文件，已取消更新")
+    return root_files, static_files, files
+
+def staged_update_file_list(staging_root: str) -> Tuple[List[str], List[str], List[str]]:
+    root_files = []
+    static_files = []
+    for root_dir, _, names in os.walk(staging_root):
+        for name in names:
+            path = os.path.abspath(os.path.join(root_dir, name))
+            rel = os.path.relpath(path, staging_root).replace("\\", "/")
+            if not update_allowed_file(rel):
+                continue
+            if rel.startswith("static/"):
+                static_files.append(rel)
+            else:
+                root_files.append(rel)
+    if "main.py" not in root_files or "VERSION" not in root_files:
+        raise RuntimeError("更新源缺少 main.py 或 VERSION")
+    if not static_files:
+        raise RuntimeError("更新源未返回 static 文件，已取消更新")
+    root_files = sorted(set(root_files))
+    static_files = sorted(set(static_files))
+    return root_files, static_files, root_files + static_files
+
+UPDATE_SOURCE_LABELS = {"github": "GitHub", "modelscope": "ModelScope"}
+
+def normalize_update_source(value: str) -> str:
+    source = str(value or "github").strip().lower()
+    if source == "ms":
+        return "modelscope"
+    if source not in {"github", "modelscope"}:
+        return "github"
+    return source
+
+def stage_update_from_source(source: str, staging_root: str) -> Tuple[List[str], List[str], List[str]]:
+    """下载指定源的更新文件到 staging，返回 (root_files, static_files, files)。失败抛异常。"""
+    if source == "modelscope":
+        download_modelscope_update_files(staging_root)
+        return staged_update_file_list(staging_root)
+    root_files, static_files, files = github_update_file_list()
+    download_github_update_files(files, staging_root)
+    return root_files, static_files, files
 
 @app.post("/api/update-from-github")
 def update_from_github(req: UpdateRequest = UpdateRequest()):
     if not UPDATE_LOCK.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="正在更新中，请稍后再试")
     staging_root = ""
+    requested_source = normalize_update_source(req.source)
+    # 冗余设计：先用用户选择的源，失败后自动切换到另一个源兜底，全部失败才报错
+    source_order = [requested_source]
+    if req.fallback:
+        other = "modelscope" if requested_source == "github" else "github"
+        source_order.append(other)
     try:
-        tree_data = github_json(GITHUB_TREE_URL, use_etag_cache=True)
-        entries = tree_data.get("tree") or []
-        static_files = []
-        root_files = []
-        for entry in entries:
-            path = str(entry.get("path") or "").replace("\\", "/")
-            if entry.get("type") == "blob" and update_allowed_file(path):
-                if path.startswith("static/"):
-                    static_files.append(path)
-                else:
-                    root_files.append(path)
-        if "main.py" not in root_files:
-            root_files.append("main.py")
-        if "VERSION" not in root_files:
-            root_files.append("VERSION")
-        static_files = sorted(set(static_files))
-        root_files = sorted(set(root_files))
-        files = root_files + static_files
-        if not static_files:
-            raise RuntimeError("GitHub 未返回 static 文件，已取消更新")
-
         backup_root = os.path.join(DATA_DIR, "update_backups", time.strftime("%Y%m%d-%H%M%S"))
-        staging_root = os.path.join(DATA_DIR, "update_staging", f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}")
-        download_github_update_files(files, staging_root)
+
+        # 下载阶段（带兜底切换），任意源成功即停止
+        source = requested_source
+        root_files = static_files = files = None
+        download_errors: List[str] = []
+        fallback_used = False
+        for idx, candidate in enumerate(source_order):
+            attempt_staging = os.path.join(
+                DATA_DIR, "update_staging",
+                f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{candidate}",
+            )
+            if os.path.isdir(attempt_staging):
+                shutil.rmtree(attempt_staging, ignore_errors=True)
+            label = UPDATE_SOURCE_LABELS.get(candidate, candidate)
+            print(f"[update] 尝试下载源 [{idx + 1}/{len(source_order)}] {label}（{candidate}）→ {attempt_staging}")
+            try:
+                root_files, static_files, files = stage_update_from_source(candidate, attempt_staging)
+                source = candidate
+                staging_root = attempt_staging
+                fallback_used = idx > 0
+                print(f"[update] 下载源 {label} 成功，共 {len(files or [])} 个文件")
+                break
+            except Exception as exc:  # noqa: BLE001 — 记录后尝试下一个源
+                if os.path.isdir(attempt_staging):
+                    shutil.rmtree(attempt_staging, ignore_errors=True)
+                print(f"[update] 下载源 {label} 失败：{exc}")
+                traceback.print_exc()
+                download_errors.append(f"{label}：{exc}")
+        if not staging_root:
+            detail = "；".join(download_errors) or "未知错误"
+            print(f"[update] 所有下载源均失败 → {detail}")
+            raise HTTPException(status_code=502, detail=f"所有下载源均失败 → {detail}")
 
         updated = []
         for rel in root_files:
@@ -1695,16 +1981,19 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
             restart_scheduled = schedule_self_restart(req.restart_delay)
         return {
             "ok": True,
+            "source": source,
+            "source_label": UPDATE_SOURCE_LABELS.get(source, source),
+            "requested_source": requested_source,
+            "fallback_used": fallback_used,
+            "download_errors": download_errors,
             "updated": updated,
             "count": len(updated),
             "backup_dir": backup_root if os.path.exists(backup_root) else "",
             "restart_required": True,
             "restart_scheduled": restart_scheduled,
         }
-    except urllib.error.HTTPError as exc:
-        raise HTTPException(status_code=502, detail=f"GitHub 下载失败：HTTP {exc.code}") from exc
-    except urllib.error.URLError as exc:
-        raise HTTPException(status_code=502, detail=f"无法连接 GitHub：{exc.reason}") from exc
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"更新失败：{exc}") from exc
     finally:
@@ -2067,6 +2356,16 @@ class AssetLibraryBatchAddRequest(BaseModel):
     category_id: str = ""
     library_id: str = ""
     items: List[AssetLibraryAddRequest] = []
+
+class SharedFolderRegister(BaseModel):
+    path: str = ""
+    name: str = ""
+
+class SharedFolderImport(BaseModel):
+    library_id: str = ""
+    category_id: str = ""
+    folder_id: str = ""
+    paths: List[str] = []
 
 class AssetLibraryRenameRequest(BaseModel):
     name: str = ""
@@ -3914,6 +4213,126 @@ def find_asset_category_with_library(lib, category_id, library_id=""):
                 return library, cat
     return None, None
 
+# ---------------- 共享文件夹（局域网只读浏览/引用） ----------------
+SHARED_MEDIA_EXTS = {
+    ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp",
+    ".mp4", ".webm", ".mov", ".m4v", ".mkv",
+    ".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac",
+}
+SHARED_SCAN_MAX_ENTRIES = 8000
+SHARED_FOLDERS_LOCK = Lock()
+
+def shared_folders_load():
+    try:
+        with open(SHARED_FOLDERS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    folders = data.get("folders")
+    if not isinstance(folders, list):
+        folders = []
+    return {"folders": [f for f in folders if isinstance(f, dict)]}
+
+def shared_folders_save(data):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(SHARED_FOLDERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def shared_folder_by_id(folder_id):
+    for entry in shared_folders_load().get("folders", []):
+        if entry.get("id") == folder_id:
+            return entry
+    return None
+
+def shared_folder_abs(entry):
+    rel = (entry or {}).get("rel") or ""
+    return os.path.normpath(os.path.join(BASE_DIR, rel))
+
+def shared_resolve_register(path):
+    """校验 path 必须位于项目目录内、是一个存在的子目录（非项目根）。返回 (abs, rel)。"""
+    raw = (path or "").strip().strip('"').strip("'")
+    if not raw:
+        raise HTTPException(status_code=400, detail="请提供文件夹路径")
+    candidate = raw if os.path.isabs(raw) else os.path.join(BASE_DIR, raw)
+    abs_path = os.path.normpath(os.path.abspath(candidate))
+    base = os.path.normpath(os.path.abspath(BASE_DIR))
+    try:
+        common = os.path.commonpath([abs_path, base])
+    except ValueError:
+        raise HTTPException(status_code=400, detail="只允许登记项目目录内的文件夹")
+    if common != base:
+        raise HTTPException(status_code=400, detail="只允许登记项目目录内的文件夹")
+    if abs_path == base:
+        raise HTTPException(status_code=400, detail="不能直接登记项目根目录，请选择子文件夹")
+    if not os.path.isdir(abs_path):
+        raise HTTPException(status_code=400, detail="文件夹不存在")
+    rel = os.path.relpath(abs_path, base)
+    return abs_path, rel
+
+def shared_child_abs(folder_abs, rel):
+    """把相对 folder_abs 的子路径解析为绝对路径，并防止越界访问。"""
+    rel = (rel or "").replace("\\", "/").lstrip("/")
+    abs_path = os.path.normpath(os.path.join(folder_abs, rel))
+    base = os.path.normpath(os.path.abspath(folder_abs))
+    try:
+        common = os.path.commonpath([os.path.abspath(abs_path), base])
+    except ValueError:
+        raise HTTPException(status_code=400, detail="非法路径")
+    if common != base:
+        raise HTTPException(status_code=400, detail="非法路径")
+    return abs_path
+
+def scan_shared_tree(folder_id, folder_abs, rel_prefix="", display="", counter=None):
+    """递归扫描共享文件夹，返回 {id,name,path,items,children}。"""
+    if counter is None:
+        counter = {"n": 0}
+    node = {
+        "id": f"{folder_id}:{rel_prefix or '__root__'}",
+        "name": display or os.path.basename(folder_abs) or folder_abs,
+        "path": rel_prefix,
+        "items": [],
+        "children": [],
+    }
+    try:
+        entries = sorted(os.scandir(folder_abs), key=lambda e: (not e.is_dir(), e.name.lower()))
+    except OSError:
+        return node
+    for ent in entries:
+        if counter["n"] >= SHARED_SCAN_MAX_ENTRIES:
+            break
+        if ent.name.startswith(".") or ent.name.startswith("._"):
+            continue
+        child_rel = f"{rel_prefix}/{ent.name}".lstrip("/")
+        if ent.is_dir():
+            child = scan_shared_tree(folder_id, ent.path, child_rel, ent.name, counter)
+            if child["items"] or child["children"]:
+                node["children"].append(child)
+        elif ent.is_file():
+            ext = os.path.splitext(ent.name)[1].lower()
+            if ext not in SHARED_MEDIA_EXTS:
+                continue
+            counter["n"] += 1
+            try:
+                st = ent.stat()
+                size = st.st_size
+                mtime = int(st.st_mtime * 1000)
+            except OSError:
+                size = 0
+                mtime = 0
+            node["items"].append({
+                "id": f"{folder_id}:{child_rel}",
+                "name": ent.name,
+                "url": f"/api/shared-folders/{folder_id}/file?path={urllib.parse.quote(child_rel)}",
+                "kind": asset_library_media_kind(ent.name),
+                "size": size,
+                "lastModified": mtime,
+                "relativePath": child_rel,
+                "folderId": folder_id,
+            })
+    return node
+
 def builtin_prompt_templates():
     try:
         template_path = prompt_template_markdown_path()
@@ -4244,7 +4663,7 @@ def looks_like_image_media_url(value: str) -> bool:
     path = urllib.parse.urlparse(text).path or text
     return bool(re.search(r"\.(png|jpe?g|webp|gif|bmp|tiff)$", path))
 
-def volcengine_content_role(role: str, kind: str = "image") -> str:
+def volcengine_content_role(role: str, kind: str = "image") -> Optional[str]:
     value = str(role or "").strip().lower()
     allowed = {
         "first_frame", "last_frame", "reference_image",
@@ -4258,7 +4677,9 @@ def volcengine_content_role(role: str, kind: str = "image") -> str:
         return "reference_audio"
     if kind == "video":
         return "reference_video"
-    return "reference_image"
+    # 修复：未显式指定 role 的纯生图请求不应兜底为 reference_image，
+    # 否则火山后端会误判为 r2v(参考图生视频)，导致 seedance/seedream 等生图模型失败。
+    return None
 
 def volcengine_video_duration(duration) -> int:
     try:
@@ -6416,6 +6837,107 @@ async def upload_ai_reference(files: List[UploadFile] = File(...)):
             f.write(content)
         uploaded.append({"url": output_url_for(filename, "input"), "name": file.filename or filename, "kind": kind})
     return {"files": uploaded}
+
+def _local_upload_kind_ext(filename, content_type):
+    image_exts = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+    video_exts = {".mp4", ".webm", ".mov", ".m4v"}
+    audio_exts = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
+    ext = os.path.splitext(filename or "")[1].lower()
+    ct = (content_type or "").lower()
+    if ext in video_exts or ct.startswith("video/"):
+        if ext not in video_exts:
+            ext = ".webm" if "webm" in ct else ".mov" if "quicktime" in ct else ".mp4"
+        return "video", ext
+    if ext in audio_exts or ct.startswith("audio/"):
+        if ext not in audio_exts:
+            ext = ".wav" if "wav" in ct else ".ogg" if "ogg" in ct else ".m4a" if "mp4" in ct else ".mp3"
+        return "audio", ext
+    if ext in image_exts or ct.startswith("image/"):
+        if ext not in image_exts:
+            ext = ".jpg" if "jpeg" in ct else ".webp" if "webp" in ct else ".gif" if "gif" in ct else ".png"
+        return "image", ext
+    return None, ext
+
+def _local_upload_display_name(filename):
+    # 文件名形如 up_<hex>_<原始名>；去掉前缀还原展示名
+    m = re.match(r"^up_[0-9a-f]{12}_(.+)$", filename)
+    return m.group(1) if m else filename
+
+def _local_upload_item(filename):
+    path = os.path.join(LOCAL_UPLOAD_DIR, filename)
+    try:
+        stat = os.stat(path)
+        size = stat.st_size
+        created_at = stat.st_mtime
+    except OSError:
+        size = 0
+        created_at = 0
+    kind, _ = _local_upload_kind_ext(filename, "")
+    return {
+        "id": filename,
+        "file": filename,
+        "name": _local_upload_display_name(filename),
+        "url": f"/assets/uploads/{filename}",
+        "kind": kind or "image",
+        "size": size,
+        "created_at": created_at,
+    }
+
+@app.post("/api/local-assets/upload")
+async def upload_local_assets(files: List[UploadFile] = File(...)):
+    uploaded = []
+    for file in files:
+        content = await file.read()
+        if not content:
+            continue
+        kind, ext = _local_upload_kind_ext(file.filename, file.content_type)
+        if kind is None:
+            continue
+        base = os.path.splitext(os.path.basename(file.filename or "file"))[0]
+        base = re.sub(r"[^0-9A-Za-z一-鿿._-]+", "_", base).strip("_") or "file"
+        base = base[:60]
+        filename = f"up_{uuid.uuid4().hex[:12]}_{base}{ext}"
+        path = os.path.join(LOCAL_UPLOAD_DIR, filename)
+        with open(path, "wb") as f:
+            f.write(content)
+        uploaded.append(_local_upload_item(filename))
+    return {"files": uploaded}
+
+@app.get("/api/local-assets")
+async def list_local_assets():
+    try:
+        names = os.listdir(LOCAL_UPLOAD_DIR)
+    except OSError:
+        names = []
+    items = []
+    for name in names:
+        if name.startswith("."):
+            continue
+        if not os.path.isfile(os.path.join(LOCAL_UPLOAD_DIR, name)):
+            continue
+        items.append(_local_upload_item(name))
+    items.sort(key=lambda it: it.get("created_at") or 0, reverse=True)
+    return {"items": items}
+
+@app.post("/api/local-assets/delete")
+async def delete_local_assets(payload: dict, request: Request):
+    ensure_same_origin_request(request)
+    names = payload.get("names") if isinstance(payload, dict) else None
+    if not isinstance(names, list):
+        names = []
+    deleted = []
+    for name in names:
+        name = os.path.basename(str(name or "").strip())
+        if not name:
+            continue
+        path = os.path.join(LOCAL_UPLOAD_DIR, name)
+        if os.path.isfile(path):
+            try:
+                os.remove(path)
+                deleted.append(name)
+            except OSError:
+                pass
+    return {"deleted": deleted}
 
 @app.post("/api/temp-sh/upload")
 async def temp_sh_upload(payload: TempShUploadRequest, request: Request):
@@ -8907,6 +9429,105 @@ async def batch_add_asset_library_items(payload: AssetLibraryBatchAddRequest):
         if not src:
             continue
         _, item = make_asset_library_item(src, entry.name or os.path.basename(src))
+        cat.setdefault("items", []).append(item)
+        added.append(item)
+    save_asset_library(lib)
+    return {"library": lib, "items": added}
+
+@app.get("/api/shared-folders")
+async def list_shared_folders():
+    data = shared_folders_load()
+    folders = []
+    for entry in data.get("folders", []):
+        abs_path = shared_folder_abs(entry)
+        folders.append({
+            "id": entry.get("id"),
+            "name": entry.get("name") or os.path.basename(abs_path) or abs_path,
+            "rel": entry.get("rel") or "",
+            "path": abs_path,
+            "exists": os.path.isdir(abs_path),
+            "created_at": entry.get("created_at"),
+        })
+    return {"folders": folders}
+
+@app.post("/api/shared-folders")
+async def register_shared_folder(payload: SharedFolderRegister):
+    abs_path, rel = shared_resolve_register(payload.path)
+    name = sanitize_asset_name(payload.name or os.path.basename(abs_path), "共享文件夹")
+    with SHARED_FOLDERS_LOCK:
+        data = shared_folders_load()
+        for entry in data.get("folders", []):
+            if os.path.normpath(shared_folder_abs(entry)) == os.path.normpath(abs_path):
+                entry["name"] = name
+                shared_folders_save(data)
+                return {"folder": {**entry, "path": abs_path, "exists": True}}
+        entry = {
+            "id": f"shared_{uuid.uuid4().hex[:12]}",
+            "name": name,
+            "rel": rel,
+            "created_at": now_ms(),
+        }
+        data.setdefault("folders", []).append(entry)
+        shared_folders_save(data)
+    return {"folder": {**entry, "path": abs_path, "exists": True}}
+
+@app.delete("/api/shared-folders/{folder_id}")
+async def unregister_shared_folder(folder_id: str):
+    with SHARED_FOLDERS_LOCK:
+        data = shared_folders_load()
+        before = len(data.get("folders", []))
+        data["folders"] = [f for f in data.get("folders", []) if f.get("id") != folder_id]
+        if len(data["folders"]) == before:
+            raise HTTPException(status_code=404, detail="共享文件夹不存在")
+        shared_folders_save(data)
+    return {"ok": True}
+
+@app.get("/api/shared-folders/{folder_id}/tree")
+async def get_shared_folder_tree(folder_id: str):
+    entry = shared_folder_by_id(folder_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="共享文件夹不存在")
+    abs_path = shared_folder_abs(entry)
+    if not os.path.isdir(abs_path):
+        raise HTTPException(status_code=404, detail="文件夹已不存在")
+    tree = scan_shared_tree(folder_id, abs_path, "", entry.get("name") or os.path.basename(abs_path))
+    return {"folder": {"id": folder_id, "name": entry.get("name"), "path": abs_path}, "tree": tree}
+
+@app.get("/api/shared-folders/{folder_id}/file")
+async def get_shared_folder_file(folder_id: str, path: str = ""):
+    entry = shared_folder_by_id(folder_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="共享文件夹不存在")
+    folder_abs = shared_folder_abs(entry)
+    abs_path = shared_child_abs(folder_abs, path)
+    if not os.path.isfile(abs_path):
+        raise HTTPException(status_code=404, detail="文件不存在")
+    ext = os.path.splitext(abs_path)[1].lower()
+    if ext not in SHARED_MEDIA_EXTS:
+        raise HTTPException(status_code=400, detail="不支持的文件类型")
+    return FileResponse(abs_path, media_type=content_type_for_path(abs_path))
+
+@app.post("/api/shared-folders/import")
+async def import_shared_folder_files(payload: SharedFolderImport):
+    entry = shared_folder_by_id(payload.folder_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="共享文件夹不存在")
+    folder_abs = shared_folder_abs(entry)
+    lib = load_asset_library()
+    cat = find_asset_category_in_library(lib, payload.category_id, payload.library_id)
+    if not cat:
+        raise HTTPException(status_code=404, detail="分类不存在")
+    if cat.get("type") != "image":
+        raise HTTPException(status_code=400, detail="该分类暂不支持添加媒体")
+    added = []
+    for rel in (payload.paths or [])[:200]:
+        abs_path = shared_child_abs(folder_abs, rel)
+        if not os.path.isfile(abs_path):
+            continue
+        ext = os.path.splitext(abs_path)[1].lower()
+        if ext not in SHARED_MEDIA_EXTS:
+            continue
+        _, item = make_asset_library_item(abs_path, os.path.basename(abs_path))
         cat.setdefault("items", []).append(item)
         added.append(item)
     save_asset_library(lib)

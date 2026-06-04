@@ -16,12 +16,12 @@
             } catch(e) {}
         })();
     </script>
-    <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.06.03"></script>
-    <script src="/static/vendor/js/lucide.js?v=2026.06.03"></script>
-    <script src="/static/js/theme.js?v=2026.06.03"></script>
-    <script src="/static/js/i18n.js?v=2026.06.03"></script>
-    <link rel="stylesheet" href="/static/css/canvas.css?v=2026.06.03">
-    <link rel="stylesheet" href="/static/css/theme.css?v=2026.06.03">
+    <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.06.04"></script>
+    <script src="/static/vendor/js/lucide.js?v=2026.06.04"></script>
+    <script src="/static/js/theme.js?v=2026.06.04"></script>
+    <script src="/static/js/i18n.js?v=2026.06.04"></script>
+    <link rel="stylesheet" href="/static/css/canvas.css?v=2026.06.04">
+    <link rel="stylesheet" href="/static/css/theme.css?v=2026.06.04">
 </head>
 <body>
     <div id="shell" class="shell no-canvas">
@@ -228,7 +228,7 @@
         <div id="imageEditModal" class="image-edit-modal" onclick="closeImageEditor()">
             <div class="image-edit-panel" onclick="event.stopPropagation()">
                 <div class="image-edit-head">
-                    <div>
+                    <div class="image-edit-headline">
                         <div id="imageEditTitle" class="image-edit-title" data-i18n="canvas.editImage">编辑图片</div>
                         <div id="imageEditSub" class="image-edit-sub" data-i18n="canvas.editImageSub">选择裁剪、遮罩或画笔模式</div>
                     </div>
@@ -240,7 +240,9 @@
                         <button type="button" data-image-edit-mode="brush"><i data-lucide="paintbrush" class="w-3.5 h-3.5"></i><span data-i18n="canvas.modeBrush">画笔</span></button>
                         <button type="button" data-image-edit-mode="grid"><i data-lucide="grid-3x3" class="w-3.5 h-3.5"></i><span data-i18n="canvas.modeGrid">宫格切分</span></button>
                     </div>
-                    <button class="preview-icon-btn" type="button" onclick="closeImageEditor()" title="关闭" data-i18n-title="common.close"><i data-lucide="x" class="w-4 h-4"></i></button>
+                    <div class="image-edit-head-end">
+                        <button class="preview-icon-btn" type="button" onclick="closeImageEditor()" title="关闭" data-i18n-title="common.close"><i data-lucide="x" class="w-4 h-4"></i></button>
+                    </div>
                 </div>
                 <div id="imageMaskTools" class="image-edit-tools">
                     <label><span data-i18n="canvas.brushSize">笔刷</span> <input id="maskBrushSize" type="range" min="4" max="160" value="42"></label>
@@ -328,7 +330,7 @@
         </div>
     </div>
 
-    <script src="/static/js/ltx-director-timeline.js?v=2026.06.03"></script>
-    <script src="/static/js/canvas.js?v=2026.06.03"></script>
+    <script src="/static/js/ltx-director-timeline.js?v=2026.06.04"></script>
+    <script src="/static/js/canvas.js?v=2026.06.04"></script>
 </body>
 </html>
