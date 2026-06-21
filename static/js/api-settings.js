@@ -33,9 +33,6 @@ const rhAppsList = document.getElementById('rhAppsList');
 const rhWorkflowsList = document.getElementById('rhWorkflowsList');
 const rhAppsCount = document.getElementById('rhAppsCount');
 const rhWorkflowsCount = document.getElementById('rhWorkflowsCount');
-const settingsContent = document.getElementById('settingsContent');
-const recommendContent = document.getElementById('recommendContent');
-const recommendPanel = document.getElementById('recommendPanel');
 const providerOnboardingCard = document.getElementById('providerOnboardingCard');
 const rhWorkflowEditorOverlay = document.getElementById('rhWorkflowEditorOverlay');
 const rhWorkflowEditorTitle = document.getElementById('rhWorkflowEditorTitle');
@@ -53,8 +50,6 @@ const chatModelList = document.getElementById('chatModelList');
 const videoModelList = document.getElementById('videoModelList');
 const msLoraBlock = document.getElementById('msLoraBlock');
 const msLoraList = document.getElementById('msLoraList');
-const recommendApiOverlay = document.getElementById('recommendApiOverlay');
-const recommendApiList = document.getElementById('recommendApiList');
 const VOLCENGINE_DEFAULT_BASE_URL = 'https://ark.cn-beijing.volces.com/api/v3';
 const VOLCENGINE_DEFAULT_PROJECT_NAME = 'default';
 const VOLCENGINE_DEFAULT_REGION = 'cn-beijing';
@@ -95,62 +90,7 @@ const ONBOARDING_GUIDES = {
 };
 let rhWorkflowEditorState = { open:false, index:-1, entry:null, config:null, expanded:{}, activeNodeId:'', graph:{ k:1, x:0, y:0, w:0, h:0 }, pan:null, bound:false, previewParams:{}, previewRunning:false, previewStatus:'', previewOutputs:[] };
 let rhEditorMode = 'workflow';
-let recommendInlineOpen = false;
 let providerDragId = '';
-const RECOMMENDED_APIS = [
-    {
-        name:'APIMART',
-        base_url:'https://api.apimart.ai',
-        protocol:'apimart',
-        register_url:'https://apimart.ai/zh/register?aff=1uyAbb',
-        tagKeys:['api.tagImageModels','api.tagVideoModels','api.tagLlmModels'],
-        icons:['IMG','VID','LLM'],
-        summaryKey:'api.recommendApimartSummary',
-        advantages:['模型类型覆盖广', '适合多节点混合工作流', '异步协议适合长任务']
-    },
-    {
-        name:'玉玉API',
-        base_url:'https://yuli.host',
-        protocol:'openai',
-        register_url:'https://yuli.host/register?aff=95JQ',
-        tagKeys:['api.tagImageModels','api.tagVideoModels','api.tagLlmModels'],
-        icons:['IMG','VID','LLM'],
-        summaryKey:'api.recommendYuliSummary',
-        perkKey:'api.recommendYuliPerk',
-        advantages:['模型种类最全', '图像/视频/LLM 全覆盖', '支持签到送积分'],
-        // 添加平台时预填的默认模型列表（含逐模型协议覆盖）
-        image_models:['gpt-image-2', 'gemini-3.1-flash-image-preview', 'gemini-3-pro-image-preview'],
-        chat_models:['gpt-5.5'],
-        video_models:['veo3.1-fast'],
-        model_protocols:{'gemini-3.1-flash-image-preview':'gemini', 'gemini-3-pro-image-preview':'gemini'}
-    },
-    {
-        name:'Agnes AI',
-        base_url:'https://apihub.agnes-ai.com',
-        protocol:'openai',
-        image_request_mode:'openai-json',
-        register_url:'https://platform.agnes-ai.com/settings/apiKeys',
-        tagKeys:['api.tagImageModels','api.tagVideoModels','api.tagLlmModels'],
-        icons:['IMG','VID','LLM'],
-        summaryKey:'api.recommendAgnesSummary',
-        perkKey:'api.recommendAgnesFree',
-        perkClass:'recommend-free-tag',
-        advantages:['免费额度可用', '支持 Agnes 图像与视频接口', 'OpenAI 兼容地址配置简单'],
-        image_models:['agnes-image-2.1-flash', 'agnes-image-2.0-flash'],
-        chat_models:[],
-        video_models:['agnes-video-v2.0']
-    },
-    {
-        name:'FHL',
-        base_url:'https://www.fhl.mom',
-        protocol:'openai',
-        register_url:'https://www.fhl.mom/register?aff=86L574B4T2N9',
-        tagKeys:['Codex','api.tagGptImage2'],
-        icons:['CODEX','GPT','IMG'],
-        summaryKey:'api.recommendFhlSummary',
-        advantages:['OpenAI 兼容接入', '配置路径简单', '适合图像与代码相关模型']
-    }
-];
 
 function refreshIcons(){ if(window.lucide) lucide.createIcons(); }
 function tr(key){ return window.StudioI18n ? window.StudioI18n.t(key) : key; }
@@ -433,7 +373,7 @@ function isNewUserProvider(item){
 function renderProviderOnboarding(item){
     if(!providerOnboardingCard) return;
     const guide = ONBOARDING_GUIDES[item?.id];
-    const visible = Boolean(!recommendInlineOpen && guide && isNewUserProvider(item));
+    const visible = Boolean(guide && isNewUserProvider(item));
     providerOnboardingCard.hidden = !visible;
     document.body.classList.toggle('show-provider-onboarding', visible);
     if(!visible){
@@ -636,7 +576,7 @@ function updateProtocolFromInput(){
     const item = provider();
     if(!item || !protocolInput || item.id === 'modelscope' || item.id === 'runninghub' || item.id === 'volcengine' || item.id === 'jimeng') return;
     const value = String(protocolInput.value || 'openai').toLowerCase();
-    item.protocol = ['openai', 'apimart', 'gemini', 'volcengine', 'runninghub', 'jimeng'].includes(value) ? value : 'openai';
+    item.protocol = ['openai', 'newapi', 'meai', 'apimart', 'gemini', 'volcengine', 'runninghub', 'jimeng'].includes(value) ? value : 'openai';
     if(item.protocol === 'jimeng') item.base_url = '';
     document.body.classList.toggle('show-jimeng', item.protocol === 'jimeng');
     clearVerifyResult();
@@ -1942,141 +1882,6 @@ function renderRhEntryList(target, list, kind){
         </div>
     `).join('');
 }
-function openRecommendApi(){
-    recommendInlineOpen = true;
-    syncRecommendView();
-    renderRecommendApi();
-    renderProviderOnboarding(provider());
-}
-function closeRecommendApi(){
-    if(recommendApiOverlay) recommendApiOverlay.style.display = 'none';
-    recommendInlineOpen = false;
-    syncRecommendView();
-    renderRecommendApi();
-    renderEditor();
-}
-function syncRecommendView(){
-    if(settingsContent) settingsContent.hidden = recommendInlineOpen;
-    if(recommendContent) recommendContent.hidden = !recommendInlineOpen;
-    const recommendTitle = recommendContent?.querySelector('.editor-title');
-    const recommendSub = recommendContent?.querySelector('.editor-sub');
-    if(recommendTitle) recommendTitle.textContent = tr('api.recommendPanelTitle');
-    if(recommendSub) recommendSub.textContent = tr('api.recommendPanelSub');
-    document.body.classList.toggle('show-recommend-mode', recommendInlineOpen);
-}
-function renderRecommendApi(){
-    if(!recommendPanel) return;
-    if(!recommendInlineOpen){
-        recommendPanel.innerHTML = '';
-        return;
-    }
-    const html = RECOMMENDED_APIS.map((api, index) => `
-        <section class="recommend-card recommend-platform-card" style="--recommend-index:${index}">
-            <div class="recommend-platform-info">
-                <div class="recommend-platform-head">
-                    <div>
-                        <div class="recommend-name"><span>${escapeHtml(api.name)}</span></div>
-                    </div>
-                    <span class="recommend-badge">${escapeHtml(api.protocol === 'apimart' ? 'APIMart' : 'OpenAI')}</span>
-                </div>
-                <p class="recommend-platform-summary">${escapeHtml(tr(api.summaryKey))}</p>
-                <div class="recommend-tags">
-                    ${api.perkKey ? `<span class="recommend-tag recommend-perk-tag ${escapeAttr(api.perkClass || '')}"><i data-lucide="gift" class="w-3 h-3"></i><span>${escapeHtml(tr(api.perkKey))}</span></span>` : ''}
-                    ${(api.tagKeys || []).map(tag => `<span class="recommend-tag">${escapeHtml(tag.startsWith('api.') ? tr(tag) : tag)}</span>`).join('')}
-                </div>
-            </div>
-            <div class="recommend-platform-setup">
-                <div class="recommend-setup-title">${escapeHtml(tr('api.recommendQuickSetup'))}</div>
-                <div class="recommend-quick-stack recommend-setup-flow">
-                    <div class="recommend-guide-source onboarding-rh-source-group">
-                        <div class="onboarding-rh-source-label">${escapeHtml(tr('api.getKey'))}</div>
-                        <div class="onboarding-key-actions onboarding-rh-key-actions recommend-single-action">
-                            <a class="onboarding-key-btn recommend-guide-key-btn" href="${escapeAttr(api.register_url)}" target="_blank" rel="noopener noreferrer"><i data-lucide="key-round" class="w-3.5 h-3.5"></i><span>${escapeHtml(tr('api.getKey'))}</span></a>
-                        </div>
-                    </div>
-                    <div class="recommend-flow-arrow onboarding-flow-arrow recommend-guide-arrow" aria-hidden="true"><span></span><b></b></div>
-                    <div class="recommend-guide-save">
-                        <label class="onboarding-key-field onboarding-rh-row-field">
-                            <span>API Key</span>
-                            <input type="password" data-recommend-key="${index}" placeholder="${escapeAttr(trf('api.recommendKeyPlaceholder', {name:api.name}))}">
-                        </label>
-                        <button class="onboarding-save-btn recommend-guide-save-btn" type="button" onclick="saveRecommendedApi(${index})"><span>${escapeHtml(tr('api.save'))}</span></button>
-                    </div>
-                </div>
-            </div>
-        </section>
-    `).join('');
-    recommendPanel.innerHTML = `
-        <div class="onboarding-head">
-            <div>
-                <div class="onboarding-title">${escapeHtml(tr('api.recommendPanelTitle'))}</div>
-                <div class="onboarding-desc">${escapeHtml(tr('api.recommendPanelDesc'))}</div>
-            </div>
-        </div>
-        <div class="recommend-api-body recommend-inline-body">${html}</div>
-        <div class="recommend-note">${escapeHtml(tr('api.recommendApiNote'))}</div>
-        <div class="recommend-account-invite">
-            <div>
-                <div class="recommend-account-title">${escapeHtml(tr('api.recommendAccountTitle'))}</div>
-                <div class="recommend-account-desc">${escapeHtml(tr('api.recommendAccountDesc'))}</div>
-            </div>
-            <a class="onboarding-key-btn recommend-account-link" href="https://bewild.ai?code=WULIDX" target="_blank" rel="noopener noreferrer"><i data-lucide="external-link" class="w-3.5 h-3.5"></i><span>${escapeHtml(tr('api.viewPlans'))}</span></a>
-        </div>
-    `;
-    refreshIcons();
-}
-function recommendedProviderForApi(api){
-    let item = providers.find(provider => String(provider.name || '').toLowerCase() === api.name.toLowerCase());
-    if(item) return item;
-    const baseId = normalizeId(api.name) || 'custom-api';
-    let id = baseId;
-    let suffix = 2;
-    while(providers.some(provider => provider.id === id)) id = `${baseId}-${suffix++}`;
-    item = {
-        id,
-        name:api.name,
-        base_url:api.base_url,
-        protocol:api.protocol,
-        image_request_mode:normalizeImageRequestMode(api.image_request_mode),
-        image_generation_endpoint:'',
-        image_edit_endpoint:'',
-        enabled:true,
-        primary:false,
-        image_models:Array.isArray(api.image_models) ? [...api.image_models] : [],
-        chat_models:Array.isArray(api.chat_models) ? [...api.chat_models] : [],
-        video_models:Array.isArray(api.video_models) ? [...api.video_models] : [],
-        model_protocols:(api.model_protocols && typeof api.model_protocols === 'object') ? {...api.model_protocols} : {},
-        has_key:false,
-        key_preview:''
-    };
-    providers.push(item);
-    return item;
-}
-async function saveRecommendedApi(index){
-    const api = RECOMMENDED_APIS[index];
-    if(!api) return;
-    const input = recommendPanel?.querySelector(`[data-recommend-key="${index}"]`);
-    const key = input?.value.trim() || '';
-    if(!key){ alert(tr('api.enterApiKey')); return; }
-    const item = recommendedProviderForApi(api);
-    selectedId = item.id;
-    recommendInlineOpen = false;
-    syncRecommendView();
-    renderProviderList();
-    renderEditor();
-    keyInput.value = key;
-    if(protocolInput){
-        protocolInput.value = api.protocol;
-        protocolInput.dispatchEvent(new Event('change'));
-    }
-    if(imageRequestModeInput){
-        imageRequestModeInput.value = normalizeImageRequestMode(api.image_request_mode);
-        imageRequestModeInput.dispatchEvent(new Event('change'));
-    }
-    syncEditor();
-    const ok = await saveProviders();
-    if(ok) setStatus(trf('api.recommendSaved', {name:api.name}));
-}
 function sortedProviders(){
     const order = ['modelscope', 'runninghub', 'volcengine'];
     return visibleProviders().sort((a, b) => {
@@ -2264,7 +2069,6 @@ function renderEditor(){
     document.body.classList.toggle('show-volcengine-standalone', isStandaloneVolcengine);
     document.body.classList.toggle('show-jimeng', isJimeng);
     renderProviderOnboarding(item);
-    renderRecommendApi();
     if(runninghubConfigBlock){
         runninghubConfigBlock.hidden = !isRunningHub;
         runninghubConfigBlock.style.display = isRunningHub ? 'flex' : 'none';
@@ -2476,7 +2280,7 @@ function applyDetectedImageRequestMode(mode){
 function applyDetectedProtocol(protocol){
     const item = provider();
     const detected = String(protocol || '').toLowerCase();
-    if(!item || !protocolInput || !['openai', 'apimart', 'gemini', 'volcengine', 'runninghub', 'jimeng'].includes(detected)) return false;
+    if(!item || !protocolInput || !['openai', 'newapi', 'meai', 'apimart', 'gemini', 'volcengine', 'runninghub', 'jimeng'].includes(detected)) return false;
     if(String(protocolInput.value || '').toLowerCase() === detected && String(item.protocol || '').toLowerCase() === detected) return false;
     protocolInput.value = detected;
     item.protocol = detected;
@@ -2962,17 +2766,11 @@ function removeMsLora(index){
 }
 function selectProvider(id){
     if(isProviderTemporarilyHidden(providers.find(item => item.id === id))) return;
-    recommendInlineOpen = false;
-    syncRecommendView();
-    renderRecommendApi();
     syncEditor();
     selectedId = id;
     renderEditor();
 }
 function addProvider(){
-    recommendInlineOpen = false;
-    syncRecommendView();
-    renderRecommendApi();
     syncEditor();
     let id = 'custom-api';
     let index = 2;
@@ -3103,7 +2901,6 @@ async function loadProviders(){
         providers = data.providers || [];
         selectedId = sortedProviders()[0]?.id || '';
         renderEditor();
-        openRecommendApi();
         setStatus('');
     } catch(err) {
         setStatus(tr('api.loadFailed'));
@@ -3119,7 +2916,7 @@ async function saveProviders(){
             ? 'volcengine'
             : item.id === 'jimeng'
             ? 'jimeng'
-            : ['openai', 'apimart', 'gemini', 'volcengine', 'runninghub', 'jimeng'].includes(String(item.protocol || '').toLowerCase()) ? String(item.protocol).toLowerCase() : 'openai';
+            : ['openai', 'newapi', 'meai', 'apimart', 'gemini', 'volcengine', 'runninghub', 'jimeng'].includes(String(item.protocol || '').toLowerCase()) ? String(item.protocol).toLowerCase() : 'openai';
         item.image_request_mode = normalizeImageRequestMode(
             item.id === 'modelscope' || item.id === 'runninghub' || item.id === 'volcengine' || item.id === 'jimeng'
                 ? 'openai'
@@ -3220,8 +3017,7 @@ window.addEventListener('message', event => {
     if(event.data?.type === 'studio-theme' && window.StudioTheme) window.StudioTheme.set(event.data.theme);
     if(event.data?.type === 'studio-lang' && window.StudioI18n) {
         window.StudioI18n.set(event.data.lang);
-        if(recommendInlineOpen) renderRecommendApi();
-        else renderEditor();
+        renderEditor();
     }
 });
 rhWorkflowEditorOverlay?.addEventListener('mousedown', event => {
@@ -3238,18 +3034,12 @@ document.addEventListener('mousedown', event => {
     if(event.target.closest('.rh-editor-gnode,.rh-app-field-card')) return;
     closeRhNodePopover();
 });
-recommendApiOverlay?.addEventListener('mousedown', event => {
-    if(event.target === recommendApiOverlay) closeRecommendApi();
-});
 window.addEventListener('studio-lang-change', () => {
-    syncRecommendView();
-    if(recommendInlineOpen) renderRecommendApi();
-    else renderEditor();
+    renderEditor();
 });
 window.onload = () => {
     if(window.StudioTheme) window.StudioTheme.apply();
     if(window.StudioI18n) window.StudioI18n.apply();
-    syncRecommendView();
     loadProviders();
     // 平台名输入时实时预览生成的 ID
     if(nameInput) nameInput.addEventListener('input', updateIdPreview);

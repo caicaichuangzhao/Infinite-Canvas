@@ -263,8 +263,14 @@ JIMENG_LOGIN_SESSION = {
 }
 
 PROVIDER_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{2,40}$")
-SUPPORTED_PROVIDER_PROTOCOLS = {"openai", "apimart", "gemini", "volcengine", "runninghub", "jimeng"}
+SUPPORTED_PROVIDER_PROTOCOLS = {"openai", "newapi", "meai", "apimart", "gemini", "volcengine", "runninghub", "jimeng"}
 SUPPORTED_IMAGE_REQUEST_MODES = {"openai", "openai-json"}
+MEAI_DEFAULT_BASE_URL = "https://api.meai.cloud"
+MEAI_DEFAULT_IMAGE_MODELS = ["seedream-5.0", "seedream-4.5"]
+MEAI_DEFAULT_VIDEO_MODELS = ["seedance-2.0", "happyhorse-1.0", "wan2.7"]
+API70_DEFAULT_BASE_URL = "https://70api.top"
+API70_DEFAULT_IMAGE_MODELS = ["seedream-5.0", "seedream-4.5", "wan2.7-image-pro"]
+API70_DEFAULT_VIDEO_MODELS = ["seedance-2.0", "happyhorse-1.0", "wan2.7"]
 RUNNINGHUB_DEFAULT_BASE_URL = "https://www.runninghub.cn"
 RUNNINGHUB_OPENAPI_BASE_URL = "https://www.runninghub.cn/openapi/v2"
 RUNNINGHUB_MODEL_REGISTRY_URL = "https://raw.githubusercontent.com/HM-RunningHub/ComfyUI_RH_OpenAPI/main/models_registry.json"
@@ -511,6 +517,8 @@ MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "30"))
 AI_REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "1800"))
 IMAGE_POLL_INTERVAL = float(os.getenv("IMAGE_POLL_INTERVAL", "2"))
 IMAGE_TASK_TIMEOUT = float(os.getenv("IMAGE_TASK_TIMEOUT", str(AI_REQUEST_TIMEOUT)))
+MEAI_IMAGE_POLL_INTERVAL = float(os.getenv("MEAI_IMAGE_POLL_INTERVAL", "20"))
+MEAI_VIDEO_POLL_INTERVAL = float(os.getenv("MEAI_VIDEO_POLL_INTERVAL", "20"))
 COMFYUI_HISTORY_TIMEOUT = int(float(os.getenv("COMFYUI_HISTORY_TIMEOUT", "1800")))
 # 下载 ComfyUI 产物的 socket 超时（秒，作用于连接和每次 read）。没有它时一次网络卡顿会让 urlopen 永久挂起，
 # 导致 generate() 不返回、画布卡片一直转圈拿不到结果。给得足够大以容纳大视频/大图的正常下载。
@@ -1119,6 +1127,8 @@ def normalize_provider(item):
     protocol = str(item.get("protocol") or "openai").strip().lower()
     if protocol not in SUPPORTED_PROVIDER_PROTOCOLS:
         protocol = "openai"
+    if "api.meai.cloud" in base_url.lower():
+        protocol = "meai"
     image_request_mode = detect_image_request_mode(base_url, item.get("image_models") or []) or normalize_image_request_mode(item.get("image_request_mode"))
     image_generation_endpoint = normalize_endpoint_override(item.get("image_generation_endpoint"), "文生图端口")
     image_edit_endpoint = normalize_endpoint_override(item.get("image_edit_endpoint"), "图生图/编辑端口")
@@ -3517,11 +3527,12 @@ def sse_event(data):
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 IMAGE_OUTPUT_KEY_HINTS = (
-    "url", "image_url", "imageUrl", "image", "output_url", "outputUrl",
+    "url", "object", "image_url", "imageUrl", "image", "output_url", "outputUrl",
     "result_url", "resultUrl", "download_url", "downloadUrl", "asset_url", "assetUrl",
 )
 IMAGE_CONTAINER_KEY_HINTS = (
     "images", "image", "output", "outputs", "result", "results", "data", "items", "files",
+    "choices", "message", "content",
 )
 IMAGE_BASE64_KEY_HINTS = ("b64_json", "base64", "image_base64", "imageBase64")
 
@@ -3773,6 +3784,26 @@ def effective_protocol(provider, model=""):
 def is_apimart_provider(provider):
     base_url = str((provider or {}).get("base_url") or "").lower()
     return provider_protocol(provider) == "apimart" or "apimart.ai" in base_url
+
+def is_newapi_provider(provider):
+    base_url = str((provider or {}).get("base_url") or "").lower()
+    protocol = provider_protocol(provider)
+    return protocol == "newapi" or "70api.top" in base_url
+
+def is_70api_base_url(base_url=""):
+    return "70api.top" in str(base_url or "").lower()
+
+def is_70api_provider(provider):
+    provider_id = str((provider or {}).get("id") or "").strip().lower()
+    return provider_id == "70api" or is_70api_base_url((provider or {}).get("base_url"))
+
+def is_70api_payload(payload):
+    provider_id = str(getattr(payload, "provider_id", "") or "").strip().lower()
+    return provider_id == "70api" or is_70api_base_url(getattr(payload, "base_url", ""))
+
+def is_meai_provider(provider):
+    base_url = str((provider or {}).get("base_url") or "").lower()
+    return provider_protocol(provider) == "meai" or "api.meai.cloud" in base_url
 
 def detect_image_request_mode(base_url="", models=None):
     base = str(base_url or "").strip().lower()
@@ -4586,11 +4617,22 @@ async def generate_jimeng_video(payload: CanvasVideoRequest, provider):
 IMAGE_TASK_SUCCESS_STATUSES = {"SUCCESS", "SUCCESSFUL", "SUCCEED", "SUCCEEDED", "COMPLETED", "COMPLETE", "DONE", "FINISHED", "OK", "READY"}
 IMAGE_TASK_FAILED_STATUSES = {"FAILURE", "FAILED", "FAIL", "ERROR", "ERRORED", "CANCELED", "CANCELLED", "TIMEOUT", "REJECTED", "EXPIRED"}
 
+def terminal_status_code(value) -> str:
+    return str(value or "").strip().upper().split(":", 1)[0].strip()
+
+def status_detail_suffix(value) -> str:
+    text = str(value or "").strip()
+    if ":" not in text:
+        return ""
+    return text.split(":", 1)[1].strip()
+
 def image_task_url_for_provider(provider, task_id):
     base_url = (provider.get("base_url") if provider else AI_BASE_URL).rstrip("/")
     is_apimart = is_apimart_provider(provider)
     if is_apimart:
         return f"{base_url}/tasks/{task_id}" if base_url.endswith("/v1") else f"{base_url}/v1/tasks/{task_id}"
+    if is_meai_provider(provider):
+        return f"{base_url}/images/{task_id}" if base_url.endswith("/v1") else f"{base_url}/v1/images/{task_id}"
     return f"{base_url}/images/tasks/{task_id}" if base_url.endswith("/v1") else f"{base_url}/v1/images/tasks/{task_id}"
 
 def image_task_data(payload):
@@ -4605,7 +4647,8 @@ def image_task_status(payload):
 def image_task_fail_reason(payload):
     task_data = image_task_data(payload)
     error = task_data.get("error") if isinstance(task_data.get("error"), dict) else {}
-    return task_data.get("fail_reason") or task_data.get("message") or error.get("message") or (payload.get("message") if isinstance(payload, dict) else "") or "生图任务失败"
+    status_detail = status_detail_suffix(task_data.get("status") or task_data.get("task_status"))
+    return status_detail or task_data.get("fail_reason") or task_data.get("message") or error.get("message") or (payload.get("message") if isinstance(payload, dict) else "") or "生图任务失败"
 
 async def fetch_image_task_payload(client, task_id, provider=None):
     task_url = image_task_url_for_provider(provider, task_id)
@@ -4615,9 +4658,10 @@ async def fetch_image_task_payload(client, task_id, provider=None):
 
 async def wait_for_image_task(client, task_id, provider=None):
     is_apimart = is_apimart_provider(provider)
+    is_meai = is_meai_provider(provider)
     timeout = APIMART_IMAGE_TASK_TIMEOUT if is_apimart else IMAGE_TASK_TIMEOUT
-    interval = APIMART_IMAGE_POLL_INTERVAL if is_apimart else IMAGE_POLL_INTERVAL
-    initial_delay = APIMART_IMAGE_INITIAL_POLL_DELAY if is_apimart else 0
+    interval = MEAI_IMAGE_POLL_INTERVAL if is_meai else (APIMART_IMAGE_POLL_INTERVAL if is_apimart else IMAGE_POLL_INTERVAL)
+    initial_delay = MEAI_IMAGE_POLL_INTERVAL if is_meai else (APIMART_IMAGE_INITIAL_POLL_DELAY if is_apimart else 0)
     deadline = time.monotonic() + timeout
     last_payload = {}
     while time.monotonic() < deadline:
@@ -4628,15 +4672,16 @@ async def wait_for_image_task(client, task_id, provider=None):
                 break
         last_payload = await fetch_image_task_payload(client, task_id, provider)
         status = image_task_status(last_payload)
+        status_code = terminal_status_code(status)
         if not status:
             try:
                 if extract_image(last_payload):
                     return last_payload
             except HTTPException:
                 pass
-        if status in IMAGE_TASK_SUCCESS_STATUSES:
+        if status_code in IMAGE_TASK_SUCCESS_STATUSES:
             return last_payload
-        if status in IMAGE_TASK_FAILED_STATUSES:
+        if status_code in IMAGE_TASK_FAILED_STATUSES:
             raise HTTPException(status_code=502, detail=f"生图任务失败：{image_task_fail_reason(last_payload)}")
         await asyncio.sleep(min(interval, max(0.0, deadline - time.monotonic())))
     raw_text = json.dumps(last_payload, ensure_ascii=False)[:800] if last_payload else ""
@@ -7020,7 +7065,45 @@ async def save_ai_image_to_output(image_data, prefix="online_", category="output
         print(f"保存上游图片失败: {e}")
         return value
 
-async def save_remote_video_to_output(url, prefix="video_", category="output"):
+def provider_download_headers(provider, url):
+    if not provider:
+        return {}
+    try:
+        src_host = urllib.parse.urlparse(str(url or "")).netloc.lower()
+        base_host = urllib.parse.urlparse(str((provider or {}).get("base_url") or "")).netloc.lower()
+    except Exception:
+        return {}
+    if not src_host or not base_host or src_host != base_host:
+        return {}
+    token = os.getenv(provider_key_env(provider["id"]), "")
+    if not token:
+        return {}
+    return {"Authorization": bearer_auth_value(token)}
+
+def provider_url_requires_backend_download(provider, url):
+    headers = provider_download_headers(provider, url)
+    if not headers:
+        return False
+    path = urllib.parse.urlparse(str(url or "")).path.lower()
+    return "/videos/" in path or "/content" in path
+
+async def save_provider_video_urls(provider, urls, prefix="video_"):
+    local_urls = []
+    for url in urls:
+        saved = await save_remote_video_to_output(url, prefix=prefix, headers=provider_download_headers(provider, url))
+        if saved == url and provider_url_requires_backend_download(provider, url):
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"{provider.get('name') or provider['id']} 视频任务已完成，但视频文件下载失败。"
+                    "上游返回的是需要 Authorization 的 /content 地址，浏览器不能直接播放；"
+                    "请稍后重试，或在上游控制台查看该任务的下载代理是否正常。"
+                ),
+            )
+        local_urls.append(saved)
+    return local_urls
+
+async def save_remote_video_to_output(url, prefix="video_", category="output", headers=None):
     if not url:
         return ""
     if url.startswith("/output/") or url.startswith("/assets/"):
@@ -7035,11 +7118,12 @@ async def save_remote_video_to_output(url, prefix="video_", category="output"):
     path = output_path_for(filename, category)
     try:
         timeout = httpx.Timeout(connect=20.0, read=VIDEO_POLL_TIMEOUT, write=60.0, pool=20.0)
-        headers = {
+        request_headers = {
             "User-Agent": "ComfyUI-API-Modelscope/1.0",
             "Accept": "video/*,application/octet-stream,*/*;q=0.8",
         }
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
+        request_headers.update(headers or {})
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=request_headers) as client:
             response = await client.get(url)
             response.raise_for_status()
             content_type = (response.headers.get("Content-Type") or "").lower()
@@ -7209,6 +7293,260 @@ def apimart_size_resolution(size):
     ratio = width / height
     best = min(common, key=lambda item: abs(ratio - item[0] / item[1]))
     return best[2], resolution
+
+MEAI_SIZE_TABLE = {
+    "1:1": {"1k": "1280*1280", "2k": "2048*2048", "4k": "4096*4096"},
+    "16:9": {"1k": "1696*960", "2k": "2688*1536", "4k": "4096*2304"},
+    "9:16": {"1k": "960*1696", "2k": "1536*2688", "4k": "2304*4096"},
+    "4:3": {"1k": "1472*1104", "2k": "2368*1728", "4k": "4096*3072"},
+    "3:4": {"1k": "1104*1472", "2k": "1728*2368", "4k": "3072*4096"},
+}
+
+def meai_size_resolution(size):
+    width, height = parse_size_pair(size)
+    raw = str(size or "").strip().lower()
+    if not width or not height:
+        if raw in {"1k", "2k", "4k"}:
+            return "1:1", raw
+        if raw in MEAI_SIZE_TABLE:
+            return raw, "2k"
+        return "1:1", "2k"
+    ratio = width / max(1, height)
+    common = [(1, 1, "1:1"), (16, 9, "16:9"), (9, 16, "9:16"), (4, 3, "4:3"), (3, 4, "3:4")]
+    aspect = min(common, key=lambda item: abs(ratio - item[0] / item[1]))[2]
+    long_edge = max(width, height)
+    pixels = width * height
+    if long_edge >= 3200 or pixels > 6_000_000:
+        resolution = "4k"
+    elif long_edge >= 1700 or pixels > 1_800_000:
+        resolution = "2k"
+    else:
+        resolution = "1k"
+    return aspect, resolution
+
+def meai_image_size(size):
+    aspect, resolution = meai_size_resolution(size)
+    return MEAI_SIZE_TABLE.get(aspect, MEAI_SIZE_TABLE["1:1"]).get(resolution, "2048*2048")
+
+def meai_video_resolution(value: str) -> str:
+    text = str(value or "").strip().upper().replace(" ", "")
+    aliases = {"": "1080P", "AUTO": "1080P", "480": "480P", "720": "720P", "1080": "1080P"}
+    text = aliases.get(text, text)
+    return text if text in {"480P", "720P", "1080P", "1K", "2K", "4K"} else "1080P"
+
+def meai_video_duration(duration) -> int:
+    try:
+        value = int(duration or 10)
+    except Exception:
+        value = 10
+    return max(1, min(15, value))
+
+def meai_public_media_url(value: str, label="素材") -> str:
+    text = str(value or "").strip()
+    if text.startswith("http://") or text.startswith("https://"):
+        return text
+    public_url = local_asset_public_url(text)
+    if public_url:
+        return public_url
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"MeAI 文档要求{label}必须是公网可访问的 http/https 地址。"
+            "请使用公网素材地址，或在 API/.env 配置 PUBLIC_MEDIA_BASE_URL / PUBLIC_BASE_URL 后再提交本地画布素材。"
+        ),
+    )
+
+def build_meai_image_body(prompt, size, model, reference_images=None):
+    content = []
+    refs = [ref for ref in (reference_images or []) if isinstance(ref, dict) and str(ref.get("url") or "").strip()]
+    for ref in refs[:ONLINE_IMAGE_REFERENCE_MAX]:
+        content.append({"image": meai_public_media_url(ref.get("url"), "参考图片")})
+    content.append({"text": str(prompt or "")})
+    parameters = {
+        "size": meai_image_size(size),
+        "n": 1,
+        "watermark": False,
+    }
+    if not refs:
+        parameters["thinking_mode"] = False
+    return {
+        "model": selected_model(model, MEAI_DEFAULT_IMAGE_MODELS[0]),
+        "input": {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": content,
+                }
+            ]
+        },
+        "parameters": parameters,
+    }
+
+def meai_video_media_type(role: str, index: int, total_images: int, multimodal: bool, model: str) -> str:
+    value = str(role or "").strip().lower()
+    if value in {"first_frame", "last_frame", "reference_image"}:
+        return value
+    if total_images <= 1 and not multimodal:
+        return "first_frame"
+    return "reference_image"
+
+def build_meai_video_body(payload, model: str):
+    requested_model = selected_model(model, MEAI_DEFAULT_VIDEO_MODELS[0])
+    media = []
+    image_refs = [ref for ref in (payload.images or []) if getattr(ref, "url", "")]
+    has_last_frame = any(str(getattr(ref, "role", "") or "").strip().lower() == "last_frame" for ref in image_refs)
+    if has_last_frame and "wan" not in requested_model.lower():
+        raise HTTPException(status_code=400, detail="MeAI 首尾帧生视频只有 wan2.7 模型支持，请切换到 wan2.7 或移除尾帧。")
+    for idx, ref in enumerate(image_refs[:5]):
+        ref_url = meai_public_media_url(getattr(ref, "url", ""), "参考图片")
+        media.append({
+            "type": meai_video_media_type(getattr(ref, "role", ""), idx, len(image_refs), payload.multimodal, requested_model),
+            "url": ref_url,
+        })
+    for ref_url in (payload.videos or [])[:5 - len(media)]:
+        if not ref_url:
+            continue
+        media.append({
+            "type": "reference_video",
+            "url": meai_public_media_url(ref_url, "参考视频"),
+        })
+    input_payload = {"prompt": str(payload.prompt or "")}
+    if media:
+        input_payload["media"] = media
+    parameters = {
+        "resolution": meai_video_resolution(payload.resolution),
+        "duration": meai_video_duration(payload.duration),
+        "prompt_extend": bool(payload.enhance_prompt),
+        "watermark": bool(payload.watermark),
+    }
+    if payload.aspect_ratio:
+        parameters["ratio"] = str(payload.aspect_ratio)
+    return {
+        "model": requested_model,
+        "input": input_payload,
+        "parameters": parameters,
+    }
+
+def api70_image_size(size):
+    width, height = parse_size_pair(size)
+    if width and height:
+        return f"{width}*{height}"
+    text = str(size or "").strip().lower()
+    if re.fullmatch(r"\d+\s*\*\s*\d+", text):
+        return re.sub(r"\s+", "", text)
+    return "1024*1024"
+
+def api70_public_media_url(value: str, label="素材") -> str:
+    text = str(value or "").strip()
+    if text.startswith("http://") or text.startswith("https://"):
+        return text
+    public_url = local_asset_public_url(text)
+    if public_url:
+        return public_url
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"70API 文档建议{label}使用公网可访问的 HTTPS 地址。"
+            "请使用公网素材地址，或在 API/.env 配置 PUBLIC_MEDIA_BASE_URL / PUBLIC_BASE_URL 后再提交本地画布素材。"
+        ),
+    )
+
+def build_70api_image_body(prompt, size, model, reference_images=None):
+    content = []
+    refs = [ref for ref in (reference_images or []) if isinstance(ref, dict) and str(ref.get("url") or "").strip()]
+    for ref in refs[:ONLINE_IMAGE_REFERENCE_MAX]:
+        content.append({"image": api70_public_media_url(ref.get("url"), "参考图片")})
+    content.append({"text": str(prompt or "")})
+    return {
+        "model": selected_model(model, "seedream-5.0"),
+        "input": {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": content,
+                }
+            ]
+        },
+        "parameters": {
+            "size": api70_image_size(size),
+            "n": 1,
+            "watermark": False,
+        },
+    }
+
+def api70_video_resolution(value: str) -> str:
+    text = str(value or "").strip().lower()
+    aliases = {"": "720p", "auto": "720p", "480": "480p", "720": "720p", "1080": "1080p"}
+    text = aliases.get(text, text)
+    return text if text in {"480p", "720p", "1080p", "1k", "2k", "4k"} else "720p"
+
+def api70_video_duration(duration) -> int:
+    try:
+        value = int(duration or 5)
+    except Exception:
+        value = 5
+    return max(1, min(60, value))
+
+def api70_video_size(aspect_ratio: str, resolution: str = "") -> str:
+    ratio = str(aspect_ratio or "16:9").strip()
+    res = api70_video_resolution(resolution)
+    table = {
+        "16:9": {"480p": "854x480", "720p": "1280x720", "1080p": "1920x1080"},
+        "9:16": {"480p": "480x854", "720p": "720x1280", "1080p": "1080x1920"},
+        "1:1": {"480p": "720x720", "720p": "1024x1024", "1080p": "1080x1080"},
+        "4:3": {"480p": "640x480", "720p": "960x720", "1080p": "1440x1080"},
+        "3:4": {"480p": "480x640", "720p": "720x960", "1080p": "1080x1440"},
+    }
+    return table.get(ratio, table["16:9"]).get(res, table.get(ratio, table["16:9"])["720p"])
+
+def build_70api_video_body(payload, model: str):
+    requested_model = selected_model(model, "seedance-2.0")
+    prompt = str(payload.prompt or "")
+    duration = api70_video_duration(payload.duration)
+    body = {
+        "model": requested_model,
+        "prompt": prompt,
+        "input": {
+            "prompt": prompt,
+        },
+        "seconds": str(duration),
+        "metadata": {
+            "ratio": str(payload.aspect_ratio or "16:9"),
+            "resolution": api70_video_resolution(payload.resolution),
+            "duration": duration,
+        },
+    }
+    size = str(payload.size or "").strip()
+    body["size"] = size if parse_size_pair(size) != (0, 0) else api70_video_size(payload.aspect_ratio, payload.resolution)
+    image_urls = []
+    for ref in (payload.images or [])[:5]:
+        ref_url = str(getattr(ref, "url", "") or "").strip()
+        if ref_url:
+            image_urls.append(api70_public_media_url(ref_url, "参考图片"))
+    if len(image_urls) == 1:
+        body["image"] = image_urls[0]
+    elif len(image_urls) > 1:
+        body["images"] = image_urls
+    content_items = []
+    for ref_url in (payload.videos or [])[:5]:
+        if not ref_url:
+            continue
+        content_items.append({
+            "type": "video_url",
+            "video_url": {
+                "url": api70_public_media_url(ref_url, "参考视频"),
+            },
+        })
+    if content_items:
+        body["metadata"]["content"] = content_items
+    if payload.seed is not None:
+        body["metadata"]["seed"] = payload.seed
+    body["metadata"]["watermark"] = bool(payload.watermark)
+    if payload.camerafixed:
+        body["metadata"]["camera_fixed"] = True
+    if payload.enhance_prompt:
+        body["metadata"]["prompt_extend"] = True
+    return body
 
 VOLCENGINE_MIN_PIXELS = 3_686_400
 VOLCENGINE_MIN_EDGE = 1536
@@ -8538,6 +8876,33 @@ async def generate_runninghub_video(payload, provider):
         local_urls = [await save_remote_video_to_output(url, prefix="rh_video_") for url in urls]
         return {"videos": local_urls, "task_id": task_id, "raw": result}
 
+async def generate_meai_provider_image(prompt, size, model, reference_images=None, provider=None):
+    provider = provider or {}
+    gen_url = provider_endpoint_url(provider, "image_generation_endpoint", "/v1/images/generations/async")
+    body = build_meai_image_body(prompt, size, model, reference_images)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=IMAGE_TASK_TIMEOUT, write=120.0, pool=20.0)) as client:
+        response = await client.post(gen_url, headers=api_headers(provider=provider, model=model), json=body)
+        response.raise_for_status()
+        raw = response.json()
+        try:
+            return extract_image(raw), raw
+        except HTTPException:
+            task_id = extract_task_id(raw) or raw.get("task_id") or raw.get("id")
+            if not task_id:
+                raise
+        result = await wait_for_image_task(client, task_id, provider)
+        return extract_image(result), result
+
+async def generate_70api_provider_image(prompt, size, model, reference_images=None, provider=None):
+    provider = provider or {}
+    gen_url = provider_endpoint_url(provider, "image_generation_endpoint", "/v1/images/generations")
+    body = build_70api_image_body(prompt, size, model, reference_images)
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=AI_REQUEST_TIMEOUT, write=120.0, pool=20.0)) as client:
+        response = await client.post(gen_url, headers=api_headers(provider=provider, model=model), json=body)
+        response.raise_for_status()
+        raw = response.json()
+        return extract_image(raw), raw
+
 async def generate_ai_image(prompt, size, quality, model, reference_images=None, provider_id="comfly"):
     provider = get_api_provider(provider_id)
     if provider["id"] == "modelscope":
@@ -8546,6 +8911,10 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
         return await generate_jimeng_provider_image(prompt, size, model, reference_images, provider)
     if is_runninghub_provider(provider):
         return await generate_runninghub_provider_image(prompt, size, model, reference_images, provider)
+    if is_70api_provider(provider):
+        return await generate_70api_provider_image(prompt, size, model, reference_images, provider)
+    if is_meai_provider(provider):
+        return await generate_meai_provider_image(prompt, size, model, reference_images, provider)
     if effective_protocol(provider, model) == "gemini":
         return await generate_gemini_provider_image(prompt, size, model, reference_images, provider)
     if is_volcengine_provider(provider):
@@ -10329,6 +10698,10 @@ def protocol_from_payload(payload):
     base_url = str(getattr(payload, "base_url", "") or "").strip().lower()
     if "runninghub.cn" in base_url or "runninghub.ai" in base_url:
         return "runninghub"
+    if "api.meai.cloud" in base_url:
+        return "meai"
+    if "70api.top" in base_url:
+        return "newapi"
     protocol = str(getattr(payload, "protocol", "") or "openai").strip().lower()
     return protocol if protocol in SUPPORTED_PROVIDER_PROTOCOLS else "openai"
 
@@ -10377,6 +10750,38 @@ def volcengine_default_model_payload(status=200, message="", raw=None):
         "chat_models": [],
         "video_models": [],
         "all": [],
+        "raw": raw,
+    }
+
+def meai_model_payload(status=200, message="", raw=None):
+    models = [*MEAI_DEFAULT_IMAGE_MODELS, *MEAI_DEFAULT_VIDEO_MODELS]
+    return {
+        "ok": True,
+        "protocol": "meai",
+        "status": status,
+        "message": message or "MeAI 文档协议已启用；该文档未提供 /v1/models，已按文档预置图片/视频模型。",
+        "model_count": len(models),
+        "image_models": MEAI_DEFAULT_IMAGE_MODELS,
+        "chat_models": [],
+        "video_models": MEAI_DEFAULT_VIDEO_MODELS,
+        "all": models,
+        "image_request_mode": "openai",
+        "raw": raw,
+    }
+
+def api70_model_payload(status=200, message="", raw=None):
+    models = [*API70_DEFAULT_IMAGE_MODELS, *API70_DEFAULT_VIDEO_MODELS]
+    return {
+        "ok": True,
+        "protocol": "newapi",
+        "status": status,
+        "message": message or "70API 图片/视频文档协议已启用；图片走 /v1/images/generations，视频走 /v1/videos。",
+        "model_count": len(models),
+        "image_models": API70_DEFAULT_IMAGE_MODELS,
+        "chat_models": [],
+        "video_models": API70_DEFAULT_VIDEO_MODELS,
+        "all": models,
+        "image_request_mode": "openai",
         "raw": raw,
     }
 
@@ -10490,7 +10895,10 @@ async def probe_volcengine_auto_detect(client, base_url: str, api_key: str):
 
 def classify_upstream_model(mid):
     lc = str(mid or "").lower()
-    video_keys = ["veo", "sora", "wan2", "wanx", "doubao-seedance", "doubao-1", "kling", "hailuo", "video", "t2v-", "i2v-", "s2v"]
+    explicit_image_keys = ["seedream", "image-pro", "text-to-image", "image-to-image", "qwen-image", "gpt-image", "dall-e"]
+    if any(k in lc for k in explicit_image_keys):
+        return "image"
+    video_keys = ["veo", "sora", "wan2", "wanx", "seedance", "happyhorse", "doubao-seedance", "doubao-1", "kling", "hailuo", "video", "t2v-", "i2v-", "s2v"]
     if any(k in lc for k in video_keys):
         return "video"
     image_keys = ["banana", "image", "dalle", "dall-e", "imagen", "flux", "stable", "sdxl", "midjourney", "nano-banana", "ideogram", "fal-ai", "z-image", "qwen-image", "klein", "seedream", "doubao-seedream", "text-to-image", "image-to-image"]
@@ -10569,6 +10977,10 @@ async def test_provider_connection(payload: TestConnectionPayload):
             "protocol": "runninghub",
             "raw": payload_models.get("raw"),
         }
+    if protocol == "newapi" and is_70api_base_url(payload.base_url):
+        return api70_model_payload(raw={"base_url": (payload.base_url or API70_DEFAULT_BASE_URL).strip().rstrip("/")})
+    if protocol == "meai":
+        return meai_model_payload(raw={"base_url": (payload.base_url or MEAI_DEFAULT_BASE_URL).strip().rstrip("/")})
     base_url = (payload.base_url or "").strip().rstrip("/")
     if not base_url:
         raise HTTPException(status_code=400, detail="请先填写请求地址")
@@ -10642,6 +11054,58 @@ async def probe_async_endpoint(payload: TestConnectionPayload):
     api_key = api_key_from_payload(payload, protocol)
     if not api_key:
         raise HTTPException(status_code=400, detail="请先填写或保存 API Key")
+    if protocol == "newapi" and is_70api_payload(payload):
+        videos_base = base_url if base_url.endswith("/v1") else f"{base_url}/v1"
+        probe_url = f"{videos_base}/videos/healthcheck_probe_do_not_submit"
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(probe_url, headers={"Authorization": bearer_auth_value(api_key), "Accept": "application/json"})
+                try:
+                    body = resp.json() if resp.text else {}
+                except Exception:
+                    body = resp.text[:500]
+                body_text = json.dumps(body, ensure_ascii=False) if isinstance(body, (dict, list)) else str(body)
+                lower_text = body_text.lower()
+                if resp.status_code in (401, 403) or "无效的令牌" in body_text or "invalid token" in lower_text:
+                    return {
+                        "ok": False,
+                        "protocol": "newapi",
+                        "status_code": resp.status_code,
+                        "message": f"70API Key 验证失败：{body_text[:300]}",
+                        "raw": body,
+                    }
+                if resp.status_code in (400, 404) or "not found" in lower_text or "invalid" in lower_text or "不存在" in body_text:
+                    payload = api70_model_payload(raw={"probe": body})
+                    payload.update({
+                        "ok": True,
+                        "status_code": resp.status_code,
+                        "message": "70API 视频查询端点可达，API Key 已通过认证；模型请按文档清单手动/预置使用。",
+                        "raw": body,
+                    })
+                    return payload
+                payload = api70_model_payload(raw={"probe": body})
+                payload.update({
+                    "ok": resp.status_code < 500,
+                    "status_code": resp.status_code,
+                    "message": f"70API 视频查询端点返回 {resp.status_code}；如不是鉴权错误，可继续用文生图/文生视频做真实模型测试。",
+                    "raw": body,
+                })
+                return payload
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=502, detail=str(e)[:300])
+    if protocol == "meai":
+        return {
+            "ok": True,
+            "protocol": "meai",
+            "status_code": 200,
+            "message": "MeAI 文档协议已启用：图片 POST /v1/images/generations/async，视频 POST /v1/videos。",
+            "raw": {"base_url": base_url or MEAI_DEFAULT_BASE_URL},
+            "model_count": len(MEAI_DEFAULT_IMAGE_MODELS) + len(MEAI_DEFAULT_VIDEO_MODELS),
+            "image_models": MEAI_DEFAULT_IMAGE_MODELS,
+            "chat_models": [],
+            "video_models": MEAI_DEFAULT_VIDEO_MODELS,
+            "all": [*MEAI_DEFAULT_IMAGE_MODELS, *MEAI_DEFAULT_VIDEO_MODELS],
+        }
     if protocol == "volcengine":
         try:
             async with httpx.AsyncClient(timeout=15) as client:
@@ -10773,6 +11237,10 @@ async def fetch_models_from_upstream(base_url: str, api_key: str, protocol: str 
     if protocol == "runninghub":
         provider = {"id": "runninghub", "name": "RunningHub", "base_url": base_url or RUNNINGHUB_DEFAULT_BASE_URL, "protocol": "runninghub", "api_key": api_key}
         return await runninghub_models_payload(provider)
+    if protocol == "newapi" and is_70api_base_url(base_url):
+        return api70_model_payload(raw={"base_url": (base_url or API70_DEFAULT_BASE_URL).strip().rstrip("/")})
+    if protocol == "meai":
+        return meai_model_payload(raw={"base_url": (base_url or MEAI_DEFAULT_BASE_URL).strip().rstrip("/")})
     base_url = (base_url or "").strip().rstrip("/")
     if not base_url:
         raise HTTPException(status_code=400, detail="请先填写请求地址")
@@ -11212,7 +11680,7 @@ async def image_params(provider_id: str = "", model: str = ""):
 # --- Canvas Video ---
 
 VIDEO_URL_KEYS = (
-    "url", "video_url", "videoUrl", "mp4_url", "mp4Url",
+    "url", "object", "video_url", "videoUrl", "mp4_url", "mp4Url",
     "output", "output_url", "outputUrl", "download_url", "downloadUrl",
     "video", "src", "uri", "preview_url", "previewUrl", "path",
     "last_frame_url", "lastFrameUrl", "remixed_from_video_id",
@@ -11230,7 +11698,7 @@ def _collect_video_url(value, urls):
             _collect_video_url(item, urls)
         return
     if isinstance(value, dict):
-        for key in ("videos", "outputs", "data", "result", "content"):
+        for key in ("videos", "outputs", "data", "result", "content", "metadata"):
             if key in value:
                 _collect_video_url(value.get(key), urls)
         for key in VIDEO_URL_KEYS:
@@ -11267,7 +11735,7 @@ def video_output_urls(raw):
     for node in candidates:
         if not isinstance(node, dict):
             continue
-        for key in ("videos", "outputs", "content"):
+        for key in ("videos", "outputs", "content", "metadata"):
             value = node.get(key)
             if value:
                 _collect_video_url(value, urls)
@@ -11294,9 +11762,25 @@ def looks_like_html_response(text: str) -> bool:
     sample = str(text or "").lstrip()[:200].lower()
     return sample.startswith("<!doctype html") or sample.startswith("<html") or "<head" in sample
 
-def video_submit_url_candidates(provider, base_url):
+def is_newapi_sora_video_model(model: str) -> bool:
+    lc = str(model or "").strip().lower()
+    return lc.startswith("sora") or "-sora" in lc or "sora-" in lc
+
+def video_submit_url_candidates(provider, base_url, model=""):
     if is_agnes_provider(provider):
         return [f"{base_url}/v1/videos"]
+    if is_meai_provider(provider):
+        return [f"{base_url}/v1/videos"]
+    if is_70api_provider(provider):
+        return [f"{base_url}/v1/videos"]
+    if is_newapi_provider(provider):
+        generic = f"{base_url}/v1/video/generations"
+        sora = f"{base_url}/v1/videos"
+        legacy = f"{base_url}/v1/videos/generations"
+        v2 = f"{base_url}/v2/videos/generations"
+        if is_newapi_sora_video_model(model):
+            return [sora, generic, legacy, v2]
+        return [generic, sora, legacy, v2]
     if is_apimart_provider(provider):
         return [f"{base_url}/videos/generations" if base_url.endswith("/v1") else f"{base_url}/v1/videos/generations"]
     if is_volcengine_provider(provider):
@@ -11315,6 +11799,21 @@ def video_task_url_candidates(provider, base_url, task_id, submit_url=""):
             f"{base_url}/agnesapi?{urllib.parse.urlencode({'video_id': task_id})}",
             f"{base_url}/v1/videos/{quoted_id}",
         ]
+    if is_meai_provider(provider):
+        quoted_id = urllib.parse.quote(str(task_id), safe="")
+        return [f"{base_url}/v1/videos/{quoted_id}"]
+    if is_70api_provider(provider):
+        quoted_id = urllib.parse.quote(str(task_id), safe="")
+        return [f"{base_url}/v1/videos/{quoted_id}"]
+    if is_newapi_provider(provider):
+        quoted_id = urllib.parse.quote(str(task_id), safe="")
+        generic = f"{base_url}/v1/video/generations/{quoted_id}"
+        sora = f"{base_url}/v1/videos/{quoted_id}"
+        legacy = f"{base_url}/v1/videos/generations/{quoted_id}"
+        generic_task = f"{base_url}/v1/tasks/{quoted_id}"
+        if "/v1/videos" in str(submit_url or "") and "/generations" not in str(submit_url or ""):
+            return [sora, generic, legacy, generic_task]
+        return [generic, sora, legacy, generic_task]
     if is_apimart_provider(provider):
         task_path = f"{base_url}/tasks/{task_id}" if base_url.endswith("/v1") else f"{base_url}/v1/tasks/{task_id}"
         return [f"{task_path}?language=zh"]
@@ -11375,7 +11874,7 @@ async def wait_for_video_task(client, provider, task_id, submit_url=""):
         raise HTTPException(status_code=400, detail=f"{provider.get('name') or provider['id']} 未配置 Base URL")
     task_urls = video_task_url_candidates(provider, base_url, task_id, submit_url)
     deadline = time.monotonic() + VIDEO_POLL_TIMEOUT
-    delay = max(2.0, IMAGE_POLL_INTERVAL)
+    delay = MEAI_VIDEO_POLL_INTERVAL if is_meai_provider(provider) else max(2.0, IMAGE_POLL_INTERVAL)
     last_payload = {}
     while time.monotonic() < deadline:
         await asyncio.sleep(delay)
@@ -11396,18 +11895,19 @@ async def wait_for_video_task(client, provider, task_id, submit_url=""):
             raise HTTPException(status_code=502, detail=f"视频任务查询失败：{task_id}")
         last_payload = raw
         task_data = raw.get("data") if isinstance(raw.get("data"), dict) else raw
-        status = str(task_data.get("status") or task_data.get("task_status") or raw.get("status") or raw.get("task_status") or "").upper()
-        if status in VIDEO_TASK_SUCCESS_STATUSES:
+        status = str(task_data.get("status") or task_data.get("task_status") or raw.get("status") or raw.get("task_status") or "")
+        status_code = terminal_status_code(status)
+        if status_code in VIDEO_TASK_SUCCESS_STATUSES:
             return raw
         # 部分上游（如玉玉API）status 字段非标准或为空，但已经返回了视频 URL ——
         # 只要不是明确的失败状态，且拿到了真实视频地址，就直接当成功处理。
-        if status not in VIDEO_TASK_FAILURE_STATUSES and video_output_urls(raw):
+        if status_code not in VIDEO_TASK_FAILURE_STATUSES and video_output_urls(raw):
             return raw
-        if status in VIDEO_TASK_FAILURE_STATUSES:
+        if status_code in VIDEO_TASK_FAILURE_STATUSES:
             error = task_data.get("error") if isinstance(task_data.get("error"), dict) else {}
-            reason = task_data.get("fail_reason") or task_data.get("message") or error.get("message") or raw.get("error") or raw.get("message") or str(raw)
+            reason = status_detail_suffix(status) or task_data.get("fail_reason") or task_data.get("message") or error.get("message") or raw.get("error") or raw.get("message") or str(raw)
             raise HTTPException(status_code=502, detail=humanize_video_task_failure(reason))
-        delay = min(delay * 1.6, 12)
+        delay = MEAI_VIDEO_POLL_INTERVAL if is_meai_provider(provider) else min(delay * 1.6, 12)
     raise HTTPException(status_code=504, detail=f"视频生成任务超时：{last_payload or task_id}")
 
 def apimart_video_size(size):
@@ -11432,6 +11932,71 @@ def agnes_video_dimensions(aspect_ratio="", resolution=""):
     width = max(64, int(round(width * scale / 8) * 8))
     height = max(64, int(round(height * scale / 8) * 8))
     return width, height
+
+def newapi_video_duration(duration) -> int:
+    try:
+        value = int(duration or 5)
+    except Exception:
+        value = 5
+    return max(1, min(60, value))
+
+def build_newapi_video_body(payload, model: str):
+    width, height = agnes_video_dimensions(payload.aspect_ratio, payload.resolution)
+    body = {
+        "model": selected_model(model, "veo3-fast"),
+        "prompt": str(payload.prompt or ""),
+        "duration": newapi_video_duration(payload.duration),
+        "width": width,
+        "height": height,
+        "n": 1,
+        "response_format": "url",
+    }
+    if payload.seed is not None:
+        body["seed"] = payload.seed
+    image_payload = []
+    for ref in (payload.images or [])[:4]:
+        if getattr(ref, "url", ""):
+            image_payload.append(reference_to_data_url(ref.dict(), max_size=1536))
+    metadata = {}
+    if image_payload:
+        body["image"] = image_payload[0]
+        if len(image_payload) > 1:
+            metadata["images"] = image_payload
+    if payload.aspect_ratio:
+        metadata["aspect_ratio"] = payload.aspect_ratio
+    if payload.resolution:
+        metadata["resolution"] = payload.resolution
+    if payload.size:
+        metadata["size"] = payload.size
+    if payload.enhance_prompt:
+        metadata["enhance_prompt"] = True
+    if payload.enable_upsample:
+        metadata["enable_upsample"] = True
+    if payload.watermark:
+        metadata["watermark"] = True
+    if payload.camerafixed:
+        metadata["camerafixed"] = True
+    if payload.return_last_frame:
+        metadata["return_last_frame"] = True
+    if payload.generate_audio:
+        metadata["generate_audio"] = True
+    if metadata:
+        body["metadata"] = metadata
+    return body
+
+def newapi_multipart_fields(body):
+    fields = {}
+    for key, value in (body or {}).items():
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            text = "true" if value else "false"
+        elif isinstance(value, (dict, list)):
+            text = json.dumps(value, ensure_ascii=False)
+        else:
+            text = str(value)
+        fields[key] = (None, text)
+    return fields
 
 def agnes_video_frame_count(duration, fps=24):
     try:
@@ -11534,7 +12099,7 @@ async def generate_agnes_video(client, payload, provider, base_url, requested_mo
     urls = video_output_urls(result)
     if not urls:
         raise HTTPException(status_code=502, detail=f"Agnes 视频生成成功但没有返回视频：{result}")
-    local_urls = [await save_remote_video_to_output(url) for url in urls]
+    local_urls = await save_provider_video_urls(provider, urls)
     return {"videos": local_urls, "task_id": task_id or video_id, "video_id": video_id or None, "raw": result}
 
 # ---- 玉玉API（yuli.host）OpenAI 视频格式：/v1/videos（multipart，支持 seconds 时长）----
@@ -11636,7 +12201,7 @@ async def generate_yuli_openai_video(client, payload, provider, base_url, reques
     urls = video_output_urls(result)
     if not urls:
         raise HTTPException(status_code=502, detail=f"视频生成成功但没有返回视频：{result}")
-    local_urls = [await save_remote_video_to_output(url) for url in urls]
+    local_urls = await save_provider_video_urls(provider, urls)
     return {"videos": local_urls, "task_id": task_id, "raw": result}
 
 def volcengine_video_prompt_text(prompt, aspect_ratio="", duration=None):
@@ -11671,13 +12236,19 @@ async def canvas_video(payload: CanvasVideoRequest):
     if not api_key:
         raise HTTPException(status_code=400, detail=f"未配置 {provider.get('name') or provider['id']} 的 API Key，请在 API 设置中填写。")
     is_apimart = is_apimart_provider(provider)
+    is_newapi = is_newapi_provider(provider)
+    is_70api = is_70api_provider(provider)
+    is_meai = is_meai_provider(provider)
     is_volcengine = is_volcengine_provider(provider)
     is_yuli = is_yuli_provider(provider)
     is_agnes = is_agnes_provider(provider, payload.model)
     volc_is_proxy = bool(is_volcengine and urllib.parse.urlparse(base_url).path.rstrip("/"))
-    submit_urls = video_submit_url_candidates(provider, base_url)
+    requested_model = selected_model(
+        payload.model,
+        "agnes-video-v2.0" if is_agnes else ("seedance-2.0" if is_70api else (MEAI_DEFAULT_VIDEO_MODELS[0] if is_meai else "veo3-fast")),
+    )
+    submit_urls = video_submit_url_candidates(provider, base_url, requested_model)
     submit_url = submit_urls[0]
-    requested_model = selected_model(payload.model, "agnes-video-v2.0" if is_agnes else "veo3-fast")
     is_veo31 = is_apimart and is_apimart_veo31_model(requested_model)
     if is_agnes:
         try:
@@ -11916,6 +12487,12 @@ async def canvas_video(payload: CanvasVideoRequest):
                         )
                     if payload.seed is not None:
                         body["seed"] = payload.seed
+                elif is_70api:
+                    body = build_70api_video_body(payload, requested_model)
+                elif is_meai:
+                    body = build_meai_video_body(payload, requested_model)
+                elif is_newapi:
+                    body = build_newapi_video_body(payload, requested_model)
                 elif is_yuli:
                     # 玉玉API（yuli.host）视频走自有 veo 统一格式：POST /v1/video/create。
                     # 字段：model / prompt / images[]（http(s) URL）/ enhance_prompt /
@@ -11992,7 +12569,14 @@ async def canvas_video(payload: CanvasVideoRequest):
             for idx, candidate_url in enumerate(submit_urls):
                 submit_url = candidate_url
                 is_last = idx == total_candidates - 1
-                response = await client.post(submit_url, headers=api_headers(provider=provider), json=body)
+                if is_newapi and not is_70api and "/v1/videos" in submit_url and "/generations" not in submit_url:
+                    response = await client.post(
+                        submit_url,
+                        headers=api_headers(json_body=False, provider=provider),
+                        files=newapi_multipart_fields(body),
+                    )
+                else:
+                    response = await client.post(submit_url, headers=api_headers(provider=provider), json=body)
                 last_response = response
                 if response.status_code >= 400:
                     # 404/405（或直接返回网页 HTML）通常表示该平台不支持这个端点路径——
@@ -12036,7 +12620,7 @@ async def canvas_video(payload: CanvasVideoRequest):
             urls = video_output_urls(result)
             if not urls:
                 raise HTTPException(status_code=502, detail=f"视频生成成功但没有返回视频：{result}")
-            local_urls = [await save_remote_video_to_output(url) for url in urls]
+            local_urls = await save_provider_video_urls(provider, urls)
             return {"videos": local_urls, "task_id": task_id, "raw": result}
     except httpx.HTTPStatusError as exc:
         text = exc.response.text
@@ -14972,5 +15556,6 @@ if __name__ == "__main__":
     # 关闭服务端协议级 WebSocket ping：部分客户端（如 PS UXP 面板）不会自动回 pong，
     # 默认 20s ping/20s 超时会把这些连接每隔一会儿就踢掉造成"频繁断连"。
     # 客户端有自己的应用层心跳 + 断线重连兜底，这里禁用协议 ping 更稳。
-    uvicorn.run(app, host="0.0.0.0", port=3000,
+    port = int(os.getenv("PORT", "3000"))
+    uvicorn.run(app, host="0.0.0.0", port=port,
                 ws_ping_interval=None, ws_ping_timeout=None)
